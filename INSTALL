@@ -1,0 +1,32 @@
+Build instructions:
+
+I have been working on Centos 6 to date.
+
+See also http://www.openmirage.org (if it is up) or 
+https://github.com/avsm/mirage-www 
+
+1. Build/install OCaml, http://caml.inria.fr/ocaml/
+
+2. Check out mirage, https://github.com/avsm/mirage
+
+Build and install it (by default into ~/mir-inst):
+> cd mirage
+> make
+> make install
+
+Add the install/bin directory to PATH, e.g.
+PATH=~/mir-inst/bin:${PATH}
+export PATH
+
+3. Compile
+> cd mirageserver
+> make
+By default unix-socket target is built for at present.
+
+4. Run
+> ./_build/unix-socket/server.bin
+
+5. Access, e.g. http://localhost:8080/
+(Port is configured in server.ml; IP addresses for mirage direct
+mode are also configured here - no current build target for that though)
+
