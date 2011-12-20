@@ -1,0 +1,9 @@
+First explorations with Mirage, towards creating simple web application(s).
+Initially based on the mirage-tutorial Http server example (stripped down
+and commented).
+
+Initially just with the unix-socket target option as far as the build is
+concerned.
+
+Chris Greenhalgh, University of Nottingham, 2011.
+
