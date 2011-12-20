@@ -5,5 +5,9 @@ and commented).
 Initially just with the unix-socket target option as far as the build is
 concerned.
 
+References:
+- mirage, https://github.com/avsm/mirage
+- mirage-tutorial, https://github.com/avsm/mirage-tutorial
+
 Chris Greenhalgh, University of Nottingham, 2011.
 
