@@ -1,7 +1,8 @@
 open OUnit
+open Lwt
 
 (** a simple soft-state data store. Initially holds a map of names to (value, 
-    optional sub-store and timeout) *)
+    optional sub-store and timeout). Assumes that any operation might block. *)
 
 (** item in the store *)
 type item = {
@@ -18,45 +19,51 @@ type item = {
 (** the store value type *)
 type t = (string,item) Hashtbl.t
 
-(** create store *)
-let create : t = 
-	Hashtbl.create 1 
+(** create store - may block *)
+let create = 
+	return (Hashtbl.create 1)
 	
-(** put name/value in store; timeout is relative time in seconds *)
-let put s name value timeout =
+(** put name/value in store; timeout is relative time in seconds - may block *)
+let put s name value timeout = 
 	let now = OS.Clock.time () in
 	let expires = match timeout with
 		  Some t -> Some (now+.t)
 	  | None   -> None in
 	let item = {name=name;jsonvalue=value;expires=expires} in
-	Hashtbl.replace s name item
+	return (Hashtbl.replace s name item)
 	
 let expired item now = match item.expires with
 	  Some t -> t<=now
 	| None   -> false
 	
-(** get value option for name *)
-let get s name =
+(** get item option for name - may block *)
+let getitem s name =
 	try 
 		let item = Hashtbl.find s name in
 	  let now = OS.Clock.time () in
-		if (expired item now) then (Hashtbl.remove s name; None) 
-		else Some item.jsonvalue
-	with Not_found -> None
+		if (expired item now) then (Hashtbl.remove s name; return None) 
+		else return (Some item)
+	with Not_found -> return None
 
-(** list values - no expire *)
+(** get value option for name - may block *)
+let get s name =
+	match_lwt getitem s name with
+		| Some item -> return (Some item.jsonvalue)
+		| None      -> return None
+
+(** list values - no expire - may block *)
 let list s =
 	let get_names name item names =
 		name :: names in
-	Hashtbl.fold get_names s []
+	return (Hashtbl.fold get_names s [])
 
-(** remove any binding; return old value *)
+(** remove any binding; return old value - may block *)
 let remove s name =
-	let value = get s name in
+	lwt value = get s name in
 	Hashtbl.remove s name;
-	value
+	return value
 
-(** purge expired values; return next expiry time *)
+(** purge expired values; return next expiry time - may block *)
 let get_expires s =
 	let now = OS.Clock.time () in
 	let find_expired name item namelist = 
@@ -70,62 +77,73 @@ let get_expires s =
 				| None -> Some m
 				| Some t -> Some (min m t) 
 	in
-	Hashtbl.fold min_expires s None
+	return (Hashtbl.fold min_expires s None)
 
 (** tests... *)
 let test_store () = 
-	let store = create in
-	put store "a" "aval" None;
-	store
+	lwt store = create in
+	put store "a" "aval" None >>
+	return store
 	 
 let test_empty _ =
-	let store = test_store () in
-	assert_equal None (get store "b")
+	lwt store = test_store () in
+	lwt res = get store "b" in
+	assert_equal None res
 
 let test_get _ =
-	let store = test_store () in
-	assert_equal (Some "aval") (get store "a")
+	lwt store = test_store () in
+	lwt res = get store "a" in
+	assert_equal (Some "aval") res
 
 let test_not_expire _ =
-	let store = test_store () in
-	put store "b" "bval" (Some 2.);
+	lwt store = test_store () in
+	put store "b" "bval" (Some 2.) >>
 	OS.Time.sleep 1. >>
-	assert_equal (Some "bval") (get store "b") >>
-	assert_equal ["a";"b"] (List.sort compare (list store)) >>
-	match get_expires store with 
+	lwt res = get store "b" in
+	assert_equal (Some "bval") res >>
+	lwt res = list store in
+	assert_equal ["a";"b"] (List.sort compare res) >>
+	match_lwt get_expires store with 
 		| None -> assert_failure "no expire time returned"
 		| Some t -> OS.Console.log_s (Printf.sprintf "expires %f vs %f" t (OS.Clock.time ()))
 			
 let test_expire _ =
-	let store = test_store () in
-	put store "b" "bval" (Some 1.);
+	lwt store = test_store () in
+	put store "b" "bval" (Some 1.) >>
 	OS.Time.sleep 2. >>
-	assert_equal None (get store "b")
+	lwt res = get store "b" in
+	assert_equal None res
 
 let test_expire2 _ =
-	let store = test_store () in
-	put store "b" "bval" (Some 1.);
+	lwt store = test_store () in
+	put store "b" "bval" (Some 1.) >>
 	OS.Time.sleep 2. >>
-	assert_equal ["a";"b"] (List.sort compare (list store)) >>
-	match get_expires store with 
+	lwt res = list store in
+	assert_equal ["a";"b"] (List.sort compare res) >>
+	match_lwt get_expires store with 
 		| None -> OS.Console.log "no expire time"; Lwt.return ()
 		| Some t -> assert_failure "expire time returned" >>
-	assert_equal ["a"] (List.sort compare (list store)) 
+	lwt res = list store in 
+	assert_equal ["a"] (List.sort compare res) 
 
 let test_replace _ =
-	let store = test_store () in
-	put store "a" "aval2" None;
-	assert_equal (Some "aval2") (get store "a")
+	lwt store = test_store () in
+	put store "a" "aval2" None >>
+	lwt res = get store "a" in
+	assert_equal (Some "aval2") res
 
 let test_remove _ =
-	let store = test_store () in
-	assert_equal (Some "aval") (remove store "a") >>
-	assert_equal None (get store "a")
+	lwt store = test_store () in
+	lwt res = remove store "a" in
+	assert_equal (Some "aval") res >>
+	lwt res = get store "a" in
+	assert_equal None res
 
 let test_list _ =
-	let store = test_store () in
-	put store "b" "bval" None;
-	let names = List.sort compare (list store) in
+	lwt store = test_store () in
+	put store "b" "bval" None >>
+	lwt res = list store in
+	let names = List.sort compare res in
 	assert_equal ["a";"b"] names
 
 let suite = "Store test" >::: ["test_empty" >:: test_empty;

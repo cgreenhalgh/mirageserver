@@ -13,6 +13,10 @@ Chris Greenhalgh, University of Nottingham, 2011.
 
 So basic server works. 
 
+It seems that HTTP POST body handling is not currently supported (in 
+lib/http/request.ml) which makes it quite hard to implement a working service at
+the moment :-(
+
 Exercise 2: a simple location-based 'game' server.
 2.1: Allow client(s) to create 'session's, tagged with name, location name, 
 lat/long/radius, timeout.

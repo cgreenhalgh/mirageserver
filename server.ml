@@ -18,7 +18,8 @@ let ip =
 (** main application function *)
 let main () =
   Log.info "Server" "listening to HTTP on port %d" port;
-  let callback = Dispatch.t in
+  lwt store = Store.create in
+  let callback = Dispatch.t store in
   (* http server configuration *)
   let spec = {
     (* bind address *)
