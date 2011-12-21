@@ -11,3 +11,18 @@ References:
 
 Chris Greenhalgh, University of Nottingham, 2011.
 
+So basic server works. 
+
+Exercise 2: a simple location-based 'game' server.
+2.1: Allow client(s) to create 'session's, tagged with name, location name, 
+lat/long/radius, timeout.
+Allow client(s) to search for sessions (all, eventually by location/range).
+
+2.2: Allow client(s) to publish their existence/location in a session with
+name, lat/long, timeout.
+Allow client(s) to query a session for info from other client(s).
+
+2.3: allow client(s) to subscribe/resubscribe to changes in a session, 
+with timeout.
+Allow client(s) to poll for changes.
+
