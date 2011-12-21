@@ -62,6 +62,8 @@ module Dynamic = struct
 			(* and marked 'TODO') in mirage's version of http *)
 			| [ `String s ] -> Log.info "HTTP" "Body %s (%n)" s (String.length s);
 				error `Not_implemented (Http.Request.path req)
+			| [ `Inchan (size, stream) ] -> Log.info "HTTP" "Body stream (%Ld)" size;
+				error `Not_implemented (Http.Request.path req)
 			| x -> error `Bad_request (Http.Request.path req)
 
 	(** dispatch session/ (exactly) *)
