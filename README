@@ -13,9 +13,24 @@ Chris Greenhalgh, University of Nottingham, 2011.
 
 So basic server works. 
 
-It seems that HTTP POST body handling is not currently supported (in 
-lib/http/request.ml) which makes it quite hard to implement a working service at
-the moment :-(
+It seems that HTTP POST body handling is not currently supported in core mirage (in 
+lib/http/request.ml). I have tried to fix this in my fork, so you'll probably need
+that for now...
+https://github.com/cgreenhalgh/mirage on the branch 
+https://github.com/cgreenhalgh/mirage/tree/httprequestfix
+
+However I have found another issue: no useful persistent data storage currently
+supported. The slightly crazy route I am considering here is:
+
+1: Implement a new I/O & storage abstraction, building on discussions with Mort 
+and emails from Anil
+
+2: Implement a simple no-sql storage system using this on top of the low-level
+block interface (something perhaps a bit like Amazon SimpleDB or CouchDB)
+
+3: carry on implementing game server...
+
+Game Server next steps:
 
 Exercise 2: a simple location-based 'game' server.
 2.1: Allow client(s) to create 'session's, tagged with name, location name, 
