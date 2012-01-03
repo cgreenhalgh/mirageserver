@@ -1,4 +1,5 @@
-(* Http server request handler, based on mirage-tutorial example. *)
+(* Http server request handler, based on mirage-tutorial example.*)
+(* Chris Greenhalgh, University of Nottingham, 2011 *)
 open Lwt
 open Regexp
 (* the next is required for the json syntax extension, which needs Json module *)
@@ -58,11 +59,21 @@ module Dynamic = struct
 	let add_session store req =
 		let bodylist = Http.Request.body req in
 		match bodylist with
-			(* Agh... POST body handling is currently not implemented (commented out*)
-			(* and marked 'TODO') in mirage's version of http *)
-			| [ `String s ] -> Log.info "HTTP" "Body %s (%n)" s (String.length s);
+			(* Note 2011-12-22 POST body handling is currently not implemented *)
+			(* in main mirage version - I have put in some fixes in my fork - cgreenhalgh *)
+			| [ `String s ] -> begin
+				Log.info "HTTP" "Body %s (%n)" s (String.length s);
+        (* at present only url-encoded POST body is decoded to params *)				
+				let a = try 
+					Http.Request.param req "a"
+				with 
+					| _ -> "UNKNOWN" in
+				Log.info "HTTP" "param a = %s" a;
 				error `Not_implemented (Http.Request.path req)
-			| [ `Inchan (size, stream) ] -> Log.info "HTTP" "Body stream (%Ld)" size;
+				end
+			| [ `Inchan (size, stream) ] -> 
+				lwt body = Http.Message.string_of_body bodylist in
+				Log.info "HTTP" "Body stream %s (%Ld)" body size;
 				error `Not_implemented (Http.Request.path req)
 			| x -> error `Bad_request (Http.Request.path req)
 
