@@ -23,7 +23,16 @@ However I have found another issue: no useful persistent data storage currently
 supported. The slightly crazy route I am considering here is:
 
 1: Implement a new I/O & storage abstraction, building on discussions with Mort 
-and emails from Anil
+and emails from Anil 
+
+=> first cut in endpoint.ml, with a first concrete implementation
+over OS.Devices.Blkif in blkendpoint.ml.
+
+Note: for blkendpoint.mir:
+For unix-socket you will need to create a file for the VBD, e.g. 
+  dd if=/dev/zero of=test.vbd bs=1024 count=1024
+and then specify it on the command-line when running the app, e.g. 
+  ./_build/unix-socket/blkifendpoint.bin -vbd test:test.vbd
 
 2: Implement a simple no-sql storage system using this on top of the low-level
 block interface (something perhaps a bit like Amazon SimpleDB or CouchDB)
