@@ -55,8 +55,8 @@
  * Total = 16
  * 
  * entry-node = BITSTRING {
- *   size [30] : 16 : unsigned;
- *   nodetype [64] : 16 : unsigned; 
+ *   size [32] : 16 : unsigned;
+ *   nodetype [2] : 16 : unsigned; 
  *   keyprefix : 64 : bitstring;
  *   keyoffset : 16 : unsigned;
  *   0 : 2;
@@ -175,8 +175,8 @@ type rootnode = {
 (** entry node type *)
 let entrynodetype = 2
 
-(** bits of key in prefix *)
-let keprefixlength = 64
+(** bits of key in prefix (bytes) *)
+let keyprefixlength = 8
 (** length of entrynode record *)
 let entrynodesize = 32
 (** entry node record *)
@@ -196,7 +196,9 @@ type nodebody = Rootnode of rootnode
  
 (** info about extra key info at end of page *)
 type extrakey = {
+	(** offset is page offset of the size word, at the end of the extrakey *)
 	koffset : int;
+	(** bytes *)
 	ksize : int;
 	extra : bitstring
 }
@@ -251,7 +253,7 @@ let parse_node data offset size nodetype : node =
 		(* entry node *)
 		bitmatch data with 
 		{
-	    ekeyprefix : 64 : bitstring; (* NB not sure if the actual length is important *)
+	    ekeyprefix : keyprefixlength*8 : bitstring; (* NB not sure if the actual length is important *)
       ekeyoffset : 16 : unsigned, littleendian;
       0 : 2;
       valuepage : 30 : unsigned, littleendian;
@@ -273,22 +275,38 @@ let parse_node data offset size nodetype : node =
 (** try to parse a structured page *)
 let parse_page page data : page =
 	(* data starts at current offset! *)
-	let rec read_nodes data offset = bitmatch data with
+	let rec read_nodes data offset nodes = bitmatch data with
 		{ size : 16 : unsigned, littleendian;
 			nodetype : 16 : unsigned, littleendian
 	  } -> 
 			if (size*8 > bitstring_length data) then
 	   	  raise (Failure (sprintf "node size too big (%d/%d)" (bitstring_length data) (size*8)))
       else if (size==0) then
-			  (* end *) ([],offset)
-			else match (read_nodes (dropbits (size*8) data) (offset+size)) with
-					(ns,offset) -> (parse_node data offset size nodetype :: ns, offset)
+			  (* end *) (nodes,offset)
+			else begin
+				let node = parse_node data offset size nodetype in
+				let nodes = node :: nodes in
+				read_nodes (dropbits (size*8) data) (offset+size) nodes
+			end
 	in
 	(* parse nodes *)
-	let (nodes,pnodeoffset) = read_nodes data 0 in
-	(* TODO: parse extra keys *)
+	let (nodes,pnodeoffset) = read_nodes data 0 [] in
+	(* parse extra keys *)
+	(* data is whole page *)
+	let rec read_extrakeys pagedata offset extrakeys = bitmatch (dropbits (offset*8) pagedata) with
+		{ size : 16 : unsigned, littleendian } ->
+			if (size==0) then
+				(* end *) (extrakeys, offset)
+			else if (size>offset) then
+				raise (Failure (sprintf "extrakey too big (%d/%d)" size offset))
+			else begin
+				let extra = subbitstring data ((offset-(size-2))*8) ((size-2)*8) in
+				let extrakey = { koffset=offset; ksize=size; extra=extra } in
+				read_extrakeys pagedata (offset-size) (extrakey :: extrakeys)
+			end in
+	let (extrakeys, pextrakeyoffset) = read_extrakeys data ((bitstring_length data)/8-2) [] in
 	{ page = page; data = data; nodes = nodes; pnodeoffset = pnodeoffset;
-	  extrakeys = []; pextrakeyoffset = (bitstring_length data)/8-2 }
+	  extrakeys = extrakeys; pextrakeyoffset = pextrakeyoffset }
 		
 (** create a rootnode for given root page & offset *)
 let create_rootnode rootpage rootoffset lastpage = BITSTRING {
@@ -311,13 +329,13 @@ let bitstring_of_entrynode n =
 	BITSTRING {
 		entrynodesize : 16 : unsigned, littleendian;
 		entrynodetype : 16 : unsigned, littleendian;
-    n.ekeyprefix : 64 : bitstring; (* NB not sure if the actual length is important *)
-    n.ekeyoffset : 16 : unsigned;
+    n.ekeyprefix : keyprefixlength*8 : bitstring; (* actual length must match *)
+    n.ekeyoffset : 16 : unsigned, littleendian;
     0 : 2;
-    n.valuepage : 30 : unsigned;
-    n.valueoffset : 16 : unsigned;
-    n.timestamp : 32;
-    n.sequence : 64
+    n.valuepage : 30 : unsigned, littleendian;
+    n.valueoffset : 16 : unsigned, littleendian;
+    n.timestamp : 32 : littleendian;
+    n.sequence : 64 : littleendian
 	}
 
 
@@ -325,6 +343,18 @@ let bitstring_of_entrynode n =
 let create_rootpage size = 
 	let rootnode = create_rootnode 0 0 0 in
 	concat [ rootnode; zeroes_bitstring ((size*8)-bitstring_length rootnode) ]
+
+(** write page back; blocking *)
+let write_page blkep page =
+  (* getbuf to write block 0 *)
+  lwt (outdata,(),outbuf) = blkep#blkout#getbuf page.page in
+  (* copy read data to writing data *)
+  bitstring_write page.data 0 outdata;
+  (* write to disk *)
+  outbuf#send () >>
+  (* happy :) *)
+  ( OS.Console.log (sprintf "wrote page %d" page.page);
+    return () )
 
 (** danger - clobber/initialise root page on specified device *)
 let init_device name = 
@@ -346,6 +376,112 @@ let init_device name =
 (** danger - clobber/initialise root page on "test"  vbd *)
 let init_device_test () = init_device "test"
 
+(** split key into fixed length prefix and option of variable length remainder *)
+let split_key key =
+	if (bitstring_length key > keyprefixlength*8) then
+		(takebits (keyprefixlength*8) key, Some (dropbits (keyprefixlength*8) key))
+	else if (bitstring_length key < keyprefixlength*8) then
+    (* note: need to pad end of key to ensure 64 bits written *)
+		(concat [ key; zeroes_bitstring (keyprefixlength*8-bitstring_length key) ], None)
+	else
+		(key, None)
+
+(** extrakeylen required for node (bytes) *)
+let extrakey_len key = 
+    if (bitstring_length key > keyprefixlength*8) then
+      (bitstring_length key)/8 - keyprefixlength
+    else
+			0
+
+(** does page have enough space for a new node? 
+    (node-size, extrakeylen[bytes]) -> bool *)
+let is_room_for_node page nodesize extrakeylen =
+	(* need at least 0:16 in the free gap *)
+	let free = page.pextrakeyoffset - page.pnodeoffset - 2 in
+	let extrakeysize = if (extrakeylen>0) then extrakeylen+2 else 0 in
+	(nodesize+extrakeysize <= free)
+
+let zero_word = zeroes_bitstring 16
+
+(** unsigned word bitstring of int *)
+let word_to_bits word = BITSTRING {
+    word : 16 : unsigned, littleendian
+}
+
+(** add new extrakey to page, push bytes into page data,
+   and return new extrakey record *)
+let add_extrakey page extrakeybits =
+	let extralen = ((bitstring_length extrakeybits)+7)/8 in
+	let len = extralen + 2 in
+	let lenoffset = page.pextrakeyoffset in
+  let keyoffset = lenoffset-extralen in
+	(* will this pad out extrakey? *)
+	let lenbits = word_to_bits len in
+	bitstring_write lenbits lenoffset page.data;
+  bitstring_write extrakeybits keyoffset page.data;
+	(* ensure zero word at end *)
+	bitstring_write zero_word (keyoffset-2) page.data;
+  { koffset = lenoffset; ksize = len; extra = extrakeybits }
+
+(** add new node record with already written optional extrakey to page,
+  updating data and returning updated page. Non-blocking, should have already
+	checked page has space *)
+let add_node page node nodebits extrakey =
+	(* update extrakey offset *)
+	let pextrakeyoffset = match extrakey with
+		| Some { koffset = offset; ksize = len; extra = extrakey } -> offset-len
+		| None -> page.pextrakeyoffset in
+	let offset = page.pnodeoffset in
+	let nodesize = node.header.size in
+	let pnodeoffset = page.pnodeoffset+nodesize in
+	let nodes = node :: page.nodes in
+	let extrakeys = match extrakey with
+    | Some extrakey -> extrakey :: page.extrakeys
+    | None -> page.extrakeys in
+  bitstring_write nodebits offset page.data;
+	(* ensure 0:16 following node *)
+	bitstring_write zero_word (offset+nodesize) page.data;
+	(* new page record *)
+	{  page = page.page;
+     data = page.data; 
+     nodes = nodes; 
+     extrakeys = extrakeys;
+     pnodeoffset = pnodeoffset; 
+     pextrakeyoffset = pextrakeyoffset }
+
+(** add an entrynode to specified page (which has enough space),
+    updating page(s) as appropriate, returning new node record and updated page record *)
+(*   ekeyprefix : bitstring;
+  ekeyoffset : int;
+  valuepage : int;
+  valueoffset : int;
+  timestamp : int32;
+  sequence : int64;
+*)
+let add_entrynode page key valuepage valueoffset timestamp sequence =
+	let (ekeyprefix,restofkey) = split_key key in
+  let extrakey = match restofkey with
+		| Some bits -> Some (add_extrakey page bits) (* NB added extrakey *)
+		| None -> None in
+  let ekeyoffset = match extrakey with
+		| Some { koffset = lenoffset } -> lenoffset
+		| None -> 0 in
+	let entrynode = {
+		ekeyprefix = ekeyprefix;
+		ekeyoffset = ekeyoffset;
+		valuepage = valuepage;
+		valueoffset = valueoffset;
+		timestamp = timestamp;
+		sequence = sequence
+	} in
+	let node = { 
+		noffset = page.pnodeoffset;
+	  header = { size = entrynodesize; nodetype = entrynodetype };
+	  body = Entrynode entrynode 
+	} in
+	let bits = bitstring_of_entrynode entrynode in
+  let page = add_node page node bits extrakey in
+	(node,page)
 
 (** test - needs Blkif 'test' *)
 let main () =
@@ -360,17 +496,50 @@ let main () =
         raise_lwt ( Failure "reading block" ) in
 	(* parse *)
   let rootpage = parse_page 0 indata in
+	let get_extrakey page offset =
+		if (offset=0) then empty_bitstring
+		else 
+			let rec find_extrakey extrakeys offset = match extrakeys with
+				| [] -> empty_bitstring
+				| { koffset = koffset ; extra = extra } :: tl -> 
+					if (koffset=offset) then extra
+					else find_extrakey tl offset in
+			find_extrakey page.extrakeys offset
+	in
 	(* print nodes *)
-	let print n = match n with
+	let print page n  = match n with
         | { noffset = noffset; body = Rootnode { 
               rootpage=rootpage; rootoffset=rootoffset; lastpage=lastpage } } ->
                 OS.Console.log (sprintf "Root node at %d is %d:%d, last page is %d" 
           noffset rootpage rootoffset lastpage)
+        | { noffset = noffset; body = Entrynode { 
+              ekeyprefix=ekeyprefix; ekeyoffset=ekeyoffset; valuepage=valuepage;
+							valueoffset=valueoffset; timestamp=timestamp; sequence=sequence } } ->
+								let keyprefix = string_of_bitstring ekeyprefix in
+								let keyprefix =
+									try
+										let ix = String.index keyprefix (Char.chr 0) in
+										String.sub keyprefix 0 ix
+									with Not_found -> keyprefix in
+								let extrakey = string_of_bitstring (get_extrakey page ekeyoffset) in
+                OS.Console.log (sprintf "Entry node at %d with key %s+@%d:%s, value at %d:%d, timestamp %ld, sequence %Ld" 
+                noffset keyprefix ekeyoffset extrakey valuepage valueoffset timestamp sequence )
         | { noffset = noffset; header = { nodetype = nodetype } } ->
                OS.Console.log (sprintf "Node %d at %d" nodetype noffset) in
-	List.iter print rootpage.nodes;
+	List.iter (print rootpage) rootpage.nodes ;
 	(* TODO: create and add an entry node, initially no extra key *)
+	let key = bitstring_of_string "abcdefghijklmnopq" in
+	let extrakeylen = extrakey_len key in
 	(* TODO: enough space in this page? if not allocate a new free page (update last) *)
+	let ok = is_room_for_node rootpage entrynodesize extrakeylen in
+ 	if (ok) then begin
+    let (node,page) = add_entrynode rootpage key 0 0 (Int32.of_float (OS.Clock.time ())) 1L in
+	  OS.Console.log (sprintf "added entry node at %d" node.noffset);
+		write_page blkep page
+ 	end else begin
+	  	OS.Console.log "No room for new node on page";
+			return ()
+	end >> 
 	(* TODO: create entrynode record; convert to bitstring; copy into current free*)
 	(* space in block; schedule write back; update cache *)
 	return ()
