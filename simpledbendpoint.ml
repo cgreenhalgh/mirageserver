@@ -21,6 +21,14 @@
  * key/value byte sequences,  starting at offset pagesize-2, with highest two
  * bytes = size including size (:) i.e. 2 bytes), ending with 0:16.
  * 
+ * Each page starts with 2 byte page type:
+ *  1 = root page (structured page)
+ *  2 = node page (structured page)
+ *  3 = value whole-page
+ *  4 = page usage map - 4 bytes/page, starting from that page; first at page 0 ?!
+ *
+ * Followed by a 2 byte page size log2
+ *
  * Each node starts with a 2-byte ID:
  *  0 = end-node
  *  1 = root-node
@@ -148,6 +156,19 @@ let get name : simpledb Lwt.t =
 		method getbuf key : bytestreamout Lwt.t = _getbuf t key;
 	end)
 	
+(** page header record *)
+type pageheader = {
+	pagetype : int;
+	pagesizelog2 : int
+}
+
+(** page header size, bytes *)
+let pageheadersize = 4
+(** root page type *)
+let rootpagetype = 1
+let nodepagetype = 2
+let valuepagetype = 3
+	
 (** root node size *)
 let rootnodesize = 32
 (** root node type *)
@@ -214,6 +235,8 @@ type node = {
 type page = {
 	(** which page *)
   page : int;
+	(** page header *)
+  pageheader : pageheader;
 	(** page data *)
   data : bitstring;
 	(** the nodes - bottom up*)
@@ -224,6 +247,20 @@ type page = {
 	pnodeoffset : int;
 	(** offset of 'end' (size 0) extrakey found *)
   pextrakeyoffset : int
+}
+
+(** parse page header *)
+let parse_pageheader data : pageheader =
+	bitmatch data with 
+		{
+			 pagetype : 16 : unsigned, littleendian;
+		   pagesizelog2 : 16 : unsigned, littleendian
+		} -> { pagetype=pagetype; pagesizelog2=pagesizelog2 }
+
+(** bitstring of page header *)
+let bitstring_of_pageheader ph = BITSTRING {
+	ph.pagetype : 16 : unsigned, littleendian;
+	ph.pagesizelog2 : 16 : unsigned, littleendian
 }
 
 (** try to parse a node - any type. data starts at current offset! *)
@@ -274,6 +311,7 @@ let parse_node data offset size nodetype : node =
 				
 (** try to parse a structured page *)
 let parse_page page data : page =
+	let pageheader = parse_pageheader data in
 	(* data starts at current offset! *)
 	let rec read_nodes data offset nodes = bitmatch data with
 		{ size : 16 : unsigned, littleendian;
@@ -290,7 +328,7 @@ let parse_page page data : page =
 			end
 	in
 	(* parse nodes *)
-	let (nodes,pnodeoffset) = read_nodes data 0 [] in
+	let (nodes,pnodeoffset) = read_nodes (dropbits (pageheadersize*8) data) pageheadersize [] in
 	(* parse extra keys *)
 	(* data is whole page *)
 	let rec read_extrakeys pagedata offset extrakeys = bitmatch (dropbits (offset*8) pagedata) with
@@ -305,7 +343,8 @@ let parse_page page data : page =
 				read_extrakeys pagedata (offset-size) (extrakey :: extrakeys)
 			end in
 	let (extrakeys, pextrakeyoffset) = read_extrakeys data ((bitstring_length data)/8-2) [] in
-	{ page = page; data = data; nodes = nodes; pnodeoffset = pnodeoffset;
+	{ page = page; pageheader = pageheader;
+	  data = data; nodes = nodes; pnodeoffset = pnodeoffset;
 	  extrakeys = extrakeys; pextrakeyoffset = pextrakeyoffset }
 		
 (** create a rootnode for given root page & offset *)
@@ -338,11 +377,18 @@ let bitstring_of_entrynode n =
     n.sequence : 64 : littleendian
 	}
 
+let sizelog2 size = 
+	let rec div2 size count = match size with
+		| 0 -> count
+		| s -> div2 (s/2) count+1
+	in (div2 size (-1))
 
-(** ininitialise the root page with a root node, only *)
-let create_rootpage size = 
+(** ininitialise a root page bitstring with a page header and root node, only *)
+let create_rootpage size sizelog2 = 
+	let rootheader = bitstring_of_pageheader 
+  	{ pagetype=rootpagetype; pagesizelog2=sizelog2 } in 
 	let rootnode = create_rootnode 0 0 0 in
-	concat [ rootnode; zeroes_bitstring ((size*8)-bitstring_length rootnode) ]
+	concat [ rootheader; rootnode; zeroes_bitstring (((size-pageheadersize)*8)-bitstring_length rootnode) ]
 
 (** write page back; blocking *)
 let write_page blkep page =
@@ -362,7 +408,8 @@ let init_device name =
 	OS.Time.sleep 3.0 >>
   lwt blkep = (Blkifendpoint.get "test") in 
   OS.Console.log (sprintf "Got Blkif name %s, sector size %d" blkep#id blkep#block_size);
-  let rootpage = create_rootpage blkep#block_size in
+  let pagesizelog2 = sizelog2 blkep#block_size in
+	let rootpage = create_rootpage blkep#block_size pagesizelog2 in
   (* getbuf to write block 0 *)
   lwt (outdata,(),outbuf) = blkep#blkout#getbuf 0 in
   (* copy read data to writing data *)
@@ -443,6 +490,7 @@ let add_node page node nodebits extrakey =
 	bitstring_write zero_word (offset+nodesize) page.data;
 	(* new page record *)
 	{  page = page.page;
+	   pageheader = page.pageheader;
      data = page.data; 
      nodes = nodes; 
      extrakeys = extrakeys;
@@ -483,8 +531,169 @@ let add_entrynode page key valuepage valueoffset timestamp sequence =
   let page = add_node page node bits extrakey in
 	(node,page)
 
+(** record identifying a state of the store, against which entries can be
+    found, read, added *)
+type version = { 
+	vrootpage : int; 
+	vrootoffset : int; 
+	vtimestamp : int32; 
+	vsequence : int64 
+}
+
+(** page/cache manager class type *)
+(* what does it do?*)
+(* 1. manage free space, e.g. allocate new value pages, find space for writing*)
+(* nodes.*)
+(* 2. cache pages in memory to reduce disk reads.*)
+(* 3. schedule/manage writing pages back to disk to increase parallelism and/or*)
+(* increase performance at the expense of some reduction in durability.*)
+(* 4. manage updates to the root node, for consistency.*)
+type session = <
+  (** get version of session *)
+  get_version : unit -> version; 
+  (** read a node (page,offset) *)
+  read_node : int -> int -> node Lwt.t;
+  (** read a value page [release??] *)
+  read_value_page : int -> page Lwt.t;
+  (** release a value page from read_value_page *)
+  release_value_page : page -> unit;
+  (** get a value output page *)
+  new_value_page : unit -> page Lwt.t;
+  (** write a value output page *)
+  write_value_page : page -> unit Lwt.t;
+  (** write a node (nodesize,extrakey option,fn extrakeyoffset->node body) -> (pagenum,node) *)
+  add_node : int -> bitstring option -> (int -> nodebody) -> (int * node) Lwt.t;
+  (** add a new entry to the master index/version (node must be entry node), already 
+      added. Blocks until (at least) this addition is in working version. *)
+  add_entry : node -> unit Lwt.t;
+	(** commit/release session *)
+  commit : unit -> unit Lwt.t;
+	(** abort *)
+  abort : unit -> unit Lwt.t
+>
+
+type pagemanager = <
+  (** get a session within which to interact with the database - read and/or add *)
+  get_session : unit -> session
+>
+
+type pagemanagerinternal = <
+  get_version : unit -> version; 
+>
+
+module IntSet = Set.Make(struct type t = int let compare = Pervasives.compare end)
+
+type noderef = int * int
+let comparenoderef ((ap,ao):noderef) ((bp,bo):noderef) =
+	let cp = Pervasives.compare ap bp in
+	if (cp==0) then
+		Pervasives.compare ao bo
+	else
+		cp
+
+module NoderefSet = Set.Make(struct type t = noderef let compare = comparenoderef end)
+
+let cachesize = 100
+type pagestatus = PageNew | PageClean | PageDirty | PageWriting
+type pageinfo = { pagestatus : pagestatus; pageinfopage : page } (* more to follow? *)
+ 
+(** page manager mutable state includes:
+    list of current sessions
+    cache of pages with states, including
+		  new, dirty, writing, clean
+	  Not sure if read_value_pages actually need tracking. *)
+class sessionimpl (mgr : pagemanagerimpl) =
+	object
+	  val mgr = mgr;
+		(** nodes read or written *)
+    val mutable noderefs = NoderefSet.empty 
+    (** value pages read and not released or new/written *)
+    val mutable value_pages = IntSet.empty
+    method get_version = mgr#get_version
+    (** read a node (page,offset) *)
+    method read_node (pagenum:int) (offset:int) : node Lwt.t = raise (Failure "unimplemented")
+    (** read a value page [release??] *)
+    method read_value_page (pagenum:int) : page Lwt.t = raise (Failure "unimplemented")
+    (** release a value page from read_value_page *)
+    method release_value_page (page:page) : unit = () (*noop*)
+    (** get a value output page *)
+    method new_value_page () : page Lwt.t = raise (Failure "unimplemented")
+    (** write a value output page *)
+    method write_value_page (page:page) : unit Lwt.t = raise (Failure "unimplemented")
+    (** write a node (nodesize,extrakey option,fn extrakeyoffset->node body) -> (pagenum,node) *)
+    method add_node (nodesize:int) (extrakey:bitstring option) (makenodebody:(int -> nodebody)) : (int * node) Lwt.t =
+			raise (Failure "unimplemented")
+    (** add a new entry to the master index/version (node must be entry node), already 
+      added. Blocks until (at least) this addition is in working version. *)
+    method add_entry (node:node) : unit Lwt.t = raise (Failure "unimplemented")
+    (** commit/release session *)
+    method commit () : unit Lwt.t = raise (Failure "unimplemented")
+    (** abort *)
+    method abort () : unit Lwt.t = raise (Failure "unimplemented")
+	end 
+and pagemanagerimpl (blkep : Blkifendpoint.t) =
+	object(mgr)
+	  val blkep = blkep;
+		val mutable sessions : sessionimpl list = []
+		(** FIFO list of pages in cache *)
+    val cachepagenums = Array.make cachesize (-1)
+		(** hashtable of pages in cache *)
+    val cachepages : (int, pageinfo) Hashtbl.t = Hashtbl.create cachesize
+		(** next slot in cache to use*)
+    val mutable nextslot = 0
+		(** cache is full? *)
+    method private free_cache_slot () =
+			let rec check_slot slot count =
+				if count<=0 then None
+				else if (cachepagenums.(slot)<0) then Some slot
+				else begin
+					let nextslot = if (slot+1>=cachesize) then 0 else slot+1 in
+					check_slot nextslot (count-1)
+				end
+	   	in			
+			let slot = nextslot in
+			nextslot <- nextslot+1;
+			check_slot nextslot cachesize
+	  (** return a free cache slot, by ensuring a page is ejected *)
+		method private eject_a_page () : int Lwt.t =
+      (* TODO: create a task *)
+			(* TODO: add the task to the page cache eject list *)
+			(* TODO: wait... *)
+			raise (Failure "unimplemented")			
+		(** load a new page from disk into cache, return pageinfo *)
+    method private load_page pagenum : page Lwt.t = 
+			(* TODO: eject a page from the cache if necessary *)
+			lwt freeslot = match (free_cache_slot ()) with
+				| Some slot -> return slot
+				| None ->
+					eject_a_page ()
+			in
+			(* TODO: create a task *)
+			(* TODO: add the page/task to the page load list *)
+			(* TODO: wait... *)
+		  raise (Failure "unimplemented")         
+
+		(** get page in cache, load if necessary *)
+    method get_page pagenum =
+			lwt pip = try 
+				return (Hashtbl.find cachepages pagenum)
+			with Not_found -> 
+				load_page pagenum
+			in
+			pip.pageinfopage
+    method get_version () = { 
+			(* TODO *)
+			vrootpage = 0; vrootoffset = 0; vtimestamp = 0l; vsequence = 0L 
+	  } 
+		method get_session () : session = 
+			let session = new sessionimpl ( mgr :> pagemanagerimpl ) in
+			sessions <- session :: sessions;
+			session
+	end
+	
+
 (** test - needs Blkif 'test' *)
-let main () =
+let test1 () =
   OS.Console.log "Looking for block device 'test'...";
   (* get/open the "test" block device as a block endpoint *)
   lwt blkep = Blkifendpoint.get "test" in 
