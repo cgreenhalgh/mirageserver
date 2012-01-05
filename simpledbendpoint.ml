@@ -310,7 +310,7 @@ let parse_node data offset size nodetype : node =
 		 raise (Failure (sprintf "Unknown node type %d" nodetype))	
 				
 (** try to parse a structured page *)
-let parse_page page data : page =
+let parse_page pagenum data : page =
 	let pageheader = parse_pageheader data in
 	(* data starts at current offset! *)
 	let rec read_nodes data offset nodes = bitmatch data with
@@ -343,7 +343,7 @@ let parse_page page data : page =
 				read_extrakeys pagedata (offset-size) (extrakey :: extrakeys)
 			end in
 	let (extrakeys, pextrakeyoffset) = read_extrakeys data ((bitstring_length data)/8-2) [] in
-	{ page = page; pageheader = pageheader;
+	{ page = pagenum; pageheader = pageheader;
 	  data = data; nodes = nodes; pnodeoffset = pnodeoffset;
 	  extrakeys = extrakeys; pextrakeyoffset = pextrakeyoffset }
 		
@@ -531,6 +531,213 @@ let add_entrynode page key valuepage valueoffset timestamp sequence =
   let page = add_node page node bits extrakey in
 	(node,page)
 
+(** page cache... *)
+
+let cachesize = 100
+type pagestatus = 
+	| PageRequested (* asked for *)
+	| PageReading (* in process *)
+	| PageNew (* new not written *)
+	| PageClean 
+	| PageDirty 
+	| PageWriting 
+	| PageWritingDirty
+	
+type pageinfo = { 
+	pageinfonum : int;
+	pagestatus : pagestatus ref; 
+	pageinfopage : page option ref; 
+	pagelock : int ref;
+	waitingforread : page Lwt.u list ref;
+} (* more to follow? *)
+
+
+type pagecache = <
+  (** lock page for read or write *)
+  lock_page : int -> page Lwt.t;
+	(** release lock on page (pagenum,dirty,new page option) *)
+	release_page : int -> bool -> page option -> unit;
+	(* wait for write? *) 
+	(** new_page data -> pagenum *)
+	new_page : bitstring -> int Lwt.t;
+>
+
+class jobqueue =
+	object (self)
+	  val jobs : int Lwt_sequence.t = Lwt_sequence.create ()
+	  val waiters : unit Lwt.u Lwt_sequence.t = Lwt_sequence.create ()
+		method put job : unit =
+			ignore (Lwt_sequence.add_l job jobs);
+			try 
+				let waiter = Lwt_sequence.take_r waiters in
+				Lwt.wakeup waiter ()
+			with Lwt_sequence.Empty -> ()
+		method get () : int Lwt.t =
+			try 
+				let job = Lwt_sequence.take_r jobs in
+				return job
+			with Lwt_sequence.Empty -> begin
+				let (thread,waiter) = Lwt.wait () in
+				ignore (Lwt_sequence.add_l waiter waiters);
+				Lwt.bind thread self#get
+		  end
+	end
+
+class pagecacheimpl (blkep : Blkifendpoint.blkendpoint) =
+	object (self)
+	  val blkep = blkep
+		(** hashtable of pages in cache *)
+    val cachepages : (int, pageinfo) Hashtbl.t = Hashtbl.create cachesize
+		(** jobqueue to coordinate with worker thread(s) *)
+		val jobqueue = new jobqueue
+		(** start worker *)
+		initializer 
+    	let (workert,workeru) = Lwt.task () in
+			let rec worker_task () : unit Lwt.t = 
+				OS.Console.log "worker waiting for request...";
+				lwt req = jobqueue#get() in
+				self#do_work req >>
+				worker_task () in
+			ignore (bind workert worker_task);
+			wakeup workeru ()
+		(** worker *)
+    method do_work pagenum =
+				OS.Console.log (sprintf "received pagecache request %d" pagenum);
+				if (Hashtbl.mem cachepages pagenum = false) then begin
+					OS.Console.log (sprintf "Pageinfo not found for request %d" pagenum);
+					return ()
+				end else begin
+					let pageinfo = Hashtbl.find cachepages pagenum in
+					match !(pageinfo.pagestatus) with
+						| PageRequested -> begin
+							(* TODO cache size? eject? *)
+							OS.Console.log (sprintf "read page %d" pagenum);
+	 				  	match_lwt (blkep#blkin#recv 0) with
+      					| Data (data,(),buf) -> begin
+										(* ok! *)
+										let page = parse_page pagenum data in
+										pageinfo.pageinfopage := Some page;
+										pageinfo.pagestatus := PageClean;
+										let waitingforread = !(pageinfo.waitingforread) in
+										pageinfo.waitingforread := [];
+										List.iter (fun u -> Lwt.wakeup u page) waitingforread;
+										return ()
+									end
+					      | _ -> begin
+										OS.Console.log (sprintf "Error reading block %d" pagenum);
+										(* retry *)
+										jobqueue#put pagenum; 
+										return ()
+									end
+						  end
+					  | PageDirty 
+						| PageWritingDirty -> begin
+						  OS.Console.log (sprintf "write page %d" pagenum);
+							pageinfo.pagestatus := PageWriting;
+							(* not exhaustive but should be ok from state *)
+							let Some page = !(pageinfo.pageinfopage) in
+							lwt (outdata,(),outbuf) = blkep#blkout#getbuf pagenum in
+						  bitstring_write page.data 0 outdata;
+						  (* write to disk *)
+  						outbuf#send () >>
+  						(* happy :) *)
+  						(OS.Console.log (sprintf "wrote page %d" pagenum);
+				      return ())
+						  end
+					 |_ -> begin 
+							OS.Console.log (sprintf "don't know what to do with page %d" pagenum);
+							return ()
+						 end
+				end
+    (** lock page for read or write *)
+    method lock_page (pagenum:int) : page Lwt.t =
+			let page_ready_state state = match state with 
+				| PageClean 
+				| PageNew
+				| PageDirty
+				| PageWriting 
+				| PageWritingDirty -> true
+				| PageRequested
+				| PageReading -> false
+			in let page_in_cache () = (Hashtbl.mem cachepages pagenum) in
+			let rec ensure_load () : page Lwt.t =
+				if (page_in_cache()=false) then begin
+					Hashtbl.add cachepages pagenum { 
+						pageinfonum = pagenum;
+						pagestatus = ref PageRequested;
+						pageinfopage = ref None;
+						pagelock = ref 0;
+						waitingforread = ref [] };
+					ensure_load ()
+ 				end else begin
+					let pageinfo = Hashtbl.find cachepages pagenum in
+					if (page_ready_state !(pageinfo.pagestatus)) then begin
+						pageinfo.pagelock := 1+ !(pageinfo.pagelock);
+						(* not exhaustive, but should follow from state *)
+						let Some page = !(pageinfo.pageinfopage) in
+						return page
+					end else begin
+						(* task... *)
+						let t,u = Lwt.task () in
+						pageinfo.waitingforread := u :: !(pageinfo.waitingforread);
+						OS.Console.log (sprintf "lock_page waiting for read on %d" pagenum);
+						jobqueue#put pagenum;
+						choose (t :: []) >>
+						ensure_load ()
+					end 
+				end in
+			ensure_load()
+  	(** release lock on page *)
+	  method release_page (pagenum:int) (dirty:bool) (page:page option) : unit = 
+			(* should be here! *)
+			let pageinfo = Hashtbl.find cachepages pagenum in
+			pageinfo.pagelock := !(pageinfo.pagelock) -1;
+			match page with 
+				| Some page -> pageinfo.pageinfopage := Some page
+				| _ -> ();
+			let unlocked = !(pageinfo.pagelock) = 0 in
+  		let pagestatus =  !(pageinfo.pagestatus) in
+			let was_clean = match pagestatus with
+				| PageDirty 
+				| PageWritingDirty -> false
+				| _ -> true 
+			in
+			if (dirty) then begin
+				pageinfo.pagestatus := (match pagestatus with
+					| PageClean -> PageDirty
+					| PageDirty -> PageDirty
+					| PageWriting 
+					| PageWritingDirty -> PageWritingDirty
+					| PageRequested 
+					| PageNew 
+					| PageReading -> raise (Failure "release_page of page in invalid state"));
+			end;
+			if ((dirty && was_clean) || unlocked) then begin
+				(* queue flush *)
+				OS.Console.log (sprintf "schedule job for %d on release (dirty=%d, unlocked=%d)" pagenum (if(dirty)then 1 else 0) (if unlocked then 1 else 0));
+				jobqueue#put pagenum				
+			end
+  	(* wait for write? *) 
+	  (** new_page data -> pagenum *)
+	  method new_page (bits:bitstring) : int Lwt.t = raise (Failure "unimplemented")
+	end
+
+let main() = 
+  OS.Console.log "Looking for block device 'test'...";
+  (* get/open the "test" block device as a block endpoint *)
+  lwt blkep = Blkifendpoint.get "test" in 
+  OS.Console.log (sprintf "OK, got blkep name %s" blkep#id);
+  let blockcache : pagecache = ((new pagecacheimpl blkep) :> pagecache) in
+	lwt page = blockcache#lock_page 0 in
+	OS.Console.log "Got page 0!"; 
+	blockcache#release_page 0 false None;
+	OS.Console.log "Released page 0!"; 
+	lwt page = blockcache#lock_page 0 in
+	OS.Console.log "Got page 0!"; 
+	blockcache#release_page 0 true None;
+	OS.Console.log "Released page 0 (dirty)!"; 
+	return ()	
+
 (** record identifying a state of the store, against which entries can be
     found, read, added *)
 type version = { 
@@ -593,10 +800,6 @@ let comparenoderef ((ap,ao):noderef) ((bp,bo):noderef) =
 
 module NoderefSet = Set.Make(struct type t = noderef let compare = comparenoderef end)
 
-let cachesize = 100
-type pagestatus = PageNew | PageClean | PageDirty | PageWriting
-type pageinfo = { pagestatus : pagestatus; pageinfopage : page } (* more to follow? *)
- 
 (** page manager mutable state includes:
     list of current sessions
     cache of pages with states, including
@@ -631,56 +834,11 @@ class sessionimpl (mgr : pagemanagerimpl) =
     (** abort *)
     method abort () : unit Lwt.t = raise (Failure "unimplemented")
 	end 
-and pagemanagerimpl (blkep : Blkifendpoint.t) =
+and pagemanagerimpl (_blkep : Blkifendpoint.blkendpoint) =
 	object(mgr)
-	  val blkep = blkep;
+	  val blkep = _blkep;
+		val pagecache = new pagecacheimpl _blkep
 		val mutable sessions : sessionimpl list = []
-		(** FIFO list of pages in cache *)
-    val cachepagenums = Array.make cachesize (-1)
-		(** hashtable of pages in cache *)
-    val cachepages : (int, pageinfo) Hashtbl.t = Hashtbl.create cachesize
-		(** next slot in cache to use*)
-    val mutable nextslot = 0
-		(** cache is full? *)
-    method private free_cache_slot () =
-			let rec check_slot slot count =
-				if count<=0 then None
-				else if (cachepagenums.(slot)<0) then Some slot
-				else begin
-					let nextslot = if (slot+1>=cachesize) then 0 else slot+1 in
-					check_slot nextslot (count-1)
-				end
-	   	in			
-			let slot = nextslot in
-			nextslot <- nextslot+1;
-			check_slot nextslot cachesize
-	  (** return a free cache slot, by ensuring a page is ejected *)
-		method private eject_a_page () : int Lwt.t =
-      (* TODO: create a task *)
-			(* TODO: add the task to the page cache eject list *)
-			(* TODO: wait... *)
-			raise (Failure "unimplemented")			
-		(** load a new page from disk into cache, return pageinfo *)
-    method private load_page pagenum : page Lwt.t = 
-			(* TODO: eject a page from the cache if necessary *)
-			lwt freeslot = match (free_cache_slot ()) with
-				| Some slot -> return slot
-				| None ->
-					eject_a_page ()
-			in
-			(* TODO: create a task *)
-			(* TODO: add the page/task to the page load list *)
-			(* TODO: wait... *)
-		  raise (Failure "unimplemented")         
-
-		(** get page in cache, load if necessary *)
-    method get_page pagenum =
-			lwt pip = try 
-				return (Hashtbl.find cachepages pagenum)
-			with Not_found -> 
-				load_page pagenum
-			in
-			pip.pageinfopage
     method get_version () = { 
 			(* TODO *)
 			vrootpage = 0; vrootoffset = 0; vtimestamp = 0l; vsequence = 0L 
