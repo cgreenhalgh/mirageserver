@@ -238,6 +238,7 @@ type rootnodebody = {
 }
 
 type rootnode = {
+	rnpage : int;
 	rnoffset : int;
 	rheader : nodeheader;
 	rbody : rootnodebody
@@ -257,6 +258,7 @@ type entrynodebody = {
 }
 
 type entrynode = {
+	enpage : int;
 	enoffset : int;
 	eheader : nodeheader;
 	ebody : entrynodebody
@@ -277,6 +279,7 @@ type btreenodebody = {
 }
 
 type btreenode = {
+	bnpage : int;
 	bnoffset : int;
 	bheader : nodeheader;
 	bbody : btreenodebody
@@ -299,6 +302,20 @@ let get_node_offset node : int = match node with
 	| Btreenode { bnoffset } -> bnoffset
 	| Unknownnode -> raise (Failure "get_node_offset for Unknownnode")
 
+(** get page *)
+let get_node_page node : int = match node with
+	| Entrynode { enpage } -> enpage
+	| Rootnode { rnpage } -> rnpage
+	| Btreenode { bnpage } -> bnpage
+	| Unknownnode -> raise (Failure "get_node_page for Unknownnode")
+
+(** get page/offset *)
+let get_node_ref node : (int*int)= match node with
+	| Entrynode { enpage; enoffset } -> (enpage,enoffset)
+	| Rootnode { rnpage; rnoffset } -> (rnpage,rnoffset)
+	| Btreenode { bnpage; bnoffset  } -> (bnpage,bnoffset)
+	| Unknownnode -> raise (Failure "get_node_ref for Unknownnode")
+
 (** get nodeheader *)
 let get_node_header node : nodeheader = match node with
 	| Entrynode { eheader } -> eheader
@@ -306,6 +323,20 @@ let get_node_header node : nodeheader = match node with
 	| Btreenode { bheader } -> bheader
 	| Unknownnode -> raise (Failure "get_node_header for Unknownnode")
  
+let get_node_level node : int = match node with
+	| Entrynode _ -> 0
+	| Btreenode { bbody = { level } } -> level
+	(* incomplete *)
+
+type keyvalue = bitstring * (bitstring option)
+
+let zero_keyvalue = (zeroes_bitstring (keyprefixlength*8), None)
+
+let get_keyvalue node : keyvalue = match node with
+	| Entrynode { ebody = { ekeyprefix; ekeyextra } } -> (ekeyprefix,ekeyextra)
+	| Btreenode { bbody = { bkeyprefix; bkeyextra } } -> (bkeyprefix,bkeyextra)
+	| _ -> zero_keyvalue
+
 (** info about extra key info at end of page *)
 type extrakey = {
 	(** offset is page offset of the size word, at the end of the extrakey *)
@@ -376,7 +407,7 @@ let parse_extrakey pagedata keyoffset : bitstring option = match keyoffset with
 	end
 	
 (** try to parse a node - any type. data starts at current page *)
-let parse_node pagedata offset size nodetype : node =
+let parse_node pagedata offset size nodetype pagenum : node =
 	(* skip header *)
 	let data = subbitstring pagedata ((offset+4)*8) (8*(size-4)) in
 	let header = { size = size; nodetype = nodetype } in
@@ -393,7 +424,7 @@ let parse_node pagedata offset size nodetype : node =
       0 : 2; (* pad *)
       lastnodepage : 30 : unsigned, littleendian;        
       0 : 2 (* pad *)
-     } -> Rootnode { rnoffset = offset; rheader = header;
+     } -> Rootnode { rnpage = pagenum; rnoffset = offset; rheader = header;
 		        rbody = { 
             magic = magic; 
             version = version;
@@ -413,7 +444,7 @@ let parse_node pagedata offset size nodetype : node =
       valueoffset : 16 : unsigned, littleendian;
       timestamp : 32 : littleendian;
       sequence : 64 : littleendian
-    } -> Entrynode { enoffset = offset; eheader = header;
+    } -> Entrynode { enpage = pagenum; enoffset = offset; eheader = header;
            ebody = { 
            ekeyprefix = ekeyprefix; 
            ekeyoffset = ekeyoffset;
@@ -435,7 +466,7 @@ let parse_node pagedata offset size nodetype : node =
       rpage : 30 : unsigned, littleendian;
       roffset : 16: unsigned, littleendian
     } -> Btreenode { 
-			bnoffset = offset; bheader = header;
+			bnpage = pagenum; bnoffset = offset; bheader = header;
       bbody = {
 		  	level = level;
     		bkeyprefix = bkeyprefix;
@@ -484,7 +515,7 @@ let bitstring_of_entrynodebody n =
 let bitstring_of_btreenodebody b =
 	BITSTRING {
 		btreenodesize : 16 : unsigned, littleendian;
-		(btreenodetype+b.level) : 16 : unsigned, littleendian;
+		(btreenodetype+(b.level-1)) : 16 : unsigned, littleendian;
     b.bkeyprefix : keyprefixlength*8 : bitstring;
     b.bkeyoffset : 16 : unsigned, littleendian;
     0 : 2;
@@ -587,7 +618,7 @@ let parse_page pagenum data : page =
       else if (size==0) then
               (* end *) (nodes,offset)
             else begin
-                let node = parse_node pagedata offset size nodetype in
+                let node = parse_node pagedata offset size nodetype pagenum in
                 let nodes = node :: nodes in
                 read_nodes pagedata (offset+size) nodes
             end
@@ -686,6 +717,31 @@ let add_node page node nodebits extrakey =
      extrakeys = extrakeys;
      pnodeoffset = pnodeoffset; 
      pextrakeyoffset = pextrakeyoffset }
+
+let compare_keyvalue (kvp1,kve1) (kvp2,kve1) : int =
+	let prefixcmp = Bitstring.compare kvp1 kvp2 in
+	if (prefixcmp != 0) then prefixcmp 
+	else match (kve1,kve1) with
+		| (None,None) -> 0
+		| (Some bs,None) -> Bitstring.compare bs (zeroes_bitstring (bitstring_length bs))
+		| (None,Some bs) -> Bitstring.compare (zeroes_bitstring (bitstring_length bs)) bs
+		| (Some bs1,Some bs2) -> Bitstring.compare bs1 bs2
+
+(** compare two entrynodes by key *)
+let compare_entrynode en1 en2 : int =
+	compare_keyvalue (en1.ebody.ekeyprefix,en1.ebody.ekeyextra) (en2.ebody.ekeyprefix,en2.ebody.ekeyextra)		
+
+let dump_of_keyvalue (ekeyprefix,ekeyextra) = 
+	let keyprefix = string_of_bitstring ekeyprefix in
+	let keyprefix =
+		try
+			let ix = String.index keyprefix (Char.chr 0) in
+			String.sub keyprefix 0 ix
+		with Not_found -> keyprefix in
+	let extrakey = match ekeyextra with
+		| None -> ""
+		| Some bs -> string_of_bitstring bs 
+  in (sprintf "%s+%s" keyprefix extrakey)
 
 (*---------------------------------------------------------------------------*)
 (* in-memory page cache with actual reads/write passed off to *)
@@ -953,10 +1009,10 @@ type session = <
   (** write a value output page *)
   write_value_page : page -> unit Lwt.t;
   (** write a node (nodesize,nodetype,extrakey option,fn extrakeyoffset->node body) -> (page,node) *)
-  add_node : int -> int -> bitstring option -> (int -> nodebody) -> (int * node) Lwt.t;
+  add_node : int -> int -> bitstring option -> (int -> nodebody) -> node Lwt.t;
   (** add a new entry to the master index/version (node must be entry node), already 
       added. Blocks until (at least) this addition is in working version. *)
-  add_entry : node -> unit Lwt.t;
+  add_entry : entrynode -> unit Lwt.t;
 	(** commit/release session *)
   commit : unit -> unit Lwt.t;
 	(** abort *)
@@ -971,6 +1027,7 @@ type sessionmanager = <
 (*---------------------------------------------------------------------------*)
 (* implementation of the internal persistence layer (nodes & value blocks) *)
 
+(* ordered set of Int *)
 module IntSet = Set.Make(struct type t = int let compare = Pervasives.compare end)
 
 type noderef = int * int
@@ -981,7 +1038,60 @@ let comparenoderef ((ap,ao):noderef) ((bp,bo):noderef) =
 	else
 		cp
 
+(* ordered set of Noderef, i.e. page+offset *)
 module NoderefSet = Set.Make(struct type t = noderef let compare = comparenoderef end)
+
+let is_null_ref (page,offset) = page=0 && offset=0
+
+(* Btree iterator helper *)
+type btreeiterstate = Left | Right
+type btreeiterrec = { btinode : btreenode; btistate : btreeiterstate }
+
+type btreeitert = (entrynode option * btreeiterrec list)
+
+let bti_entrynode t = match t with
+	| (Some en, _) -> Some en
+	| (None, _) -> None
+
+let rec bti_go_left (getnode:(noderef -> node Lwt.t)) (page,offset) (eno,recs) : btreeitert Lwt.t =
+  if (is_null_ref (page,offset)) then return (eno,recs) 
+  else begin
+    lwt node = getnode (page,offset) in
+		match node with 
+    	| Entrynode en -> return (Some en,recs)                  
+      | Btreenode bn -> 
+				let recs = { btinode=bn; btistate = Left } :: recs in
+        bti_go_left getnode (bn.bbody.lpage,bn.bbody.loffset) (eno,recs)
+      | _ -> begin
+          OS.Console.log (sprintf "invalid node type found at %d/%d in btree" page offset);
+					return (eno,recs)
+       end
+	end
+
+let bti_advance (getnode:(noderef -> node Lwt.t)) (eno,recs) : btreeitert Lwt.t =
+  match eno with
+		| None -> return (None,[]) (* noop *)
+		| Some en -> begin
+		  (* pop all trues off the top *)
+        let rec skip_right stack = match stack with
+					| { btistate = Right} :: rest -> skip_right rest
+					| _ -> stack
+				in 
+				let recs = skip_right recs in
+				(* if there is a false left, swap to true... *)
+				match recs with
+					| [] -> (* done *) return (None,[])
+					| { btistate = Left; btinode = bn } as btirec :: ts -> 
+						let recs = { btirec with btistate = Right } :: ts in
+						(* now traverse to bottom of right branch, keeping left *)
+						bti_go_left getnode (bn.bbody.rpage,bn.bbody.roffset) (None,recs)
+					| _ -> raise (Failure "Weird error: btreeiter stack with true left at top")
+			end
+
+let bti_new (getnode:(noderef -> node Lwt.t)) rootref : btreeitert Lwt.t = 
+	bti_go_left getnode rootref (None,[])
+
+type btreebuildrec = { btbnode : node; btbvalue : keyvalue; btblevel : int }
 
 (** session manager mutable state includes:
     list of current sessions
@@ -989,7 +1099,7 @@ module NoderefSet = Set.Make(struct type t = noderef let compare = comparenodere
 		  new, dirty, writing, clean
 	  Not sure if read_value_pages actually need tracking. *)
 class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : version) =
-	object
+	object (self) 
 	  val mgr = mgr;
 		val pagecache = pagecache;
 		val version = version;
@@ -997,6 +1107,8 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
     val mutable noderefs = NoderefSet.empty 
     (** value pages read and not released or new/written *)
     val mutable value_pages = IntSet.empty
+		(** entrynodes to be added to index in next commit *)
+		val mutable new_entry_nodes : entrynode list = []
     method get_version () = version
     (** read a node (page,offset) *)
     method read_node (pagenum:int) (offset:int) : node Lwt.t =
@@ -1004,11 +1116,8 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 			let rec find_node offset nodes =
 				match nodes with 
 					| [] -> raise (Failure "not found")
-					| n :: ns -> begin
-						match (get_node_offset n) with 
-							| offset -> n
-							| _ -> find_node offset ns
-						end in
+					| n :: ns -> if offset=(get_node_offset n) then n else find_node offset ns
+			in
 			try 
     		let node = find_node offset nodepage.nodes in
 				noderefs <- NoderefSet.add (pagenum,offset) noderefs;
@@ -1028,7 +1137,7 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
     (** write a value output page *)
     method write_value_page (page:page) : unit Lwt.t = raise (Failure "unimplemented")
     (** write a node (nodesize,extrakey option,fn extrakeyoffset->node body) -> node *)
-    method add_node (nodesize:int) (nodetype:int) (extrakey:bitstring option) (makenodebody:(int -> nodebody)) : (int * node) Lwt.t =
+    method add_node (nodesize:int) (nodetype:int) (extrakey:bitstring option) (makenodebody:(int -> nodebody)) : node Lwt.t =
       (* which page can this be allocated in? *)
 			(* just try the 'last node' page for now *)
 			let extrakeylen = match extrakey with None -> 0 | Some bits -> ((bitstring_length bits)/8) in
@@ -1079,9 +1188,9 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 			let nodebody = makenodebody keyoffset in
 			let header = { size = nodesize; nodetype = nodetype } in
 			let node = match nodebody with 
-				| Rootnodebody b -> Rootnode { rnoffset = nodepage.pnodeoffset; rheader = header; rbody = b }
-				| Entrynodebody b -> Entrynode { enoffset = nodepage.pnodeoffset; eheader = header; ebody = b }
-				| Btreenodebody b -> Btreenode { bnoffset = nodepage.pnodeoffset; bheader = header; bbody = b }
+				| Rootnodebody b -> Rootnode { rnpage = nodepage.page; rnoffset = nodepage.pnodeoffset; rheader = header; rbody = b }
+				| Entrynodebody b -> Entrynode { enpage = nodepage.page; enoffset = nodepage.pnodeoffset; eheader = header; ebody = b }
+				| Btreenodebody b -> Btreenode { bnpage = nodepage.page; bnoffset = nodepage.pnodeoffset; bheader = header; bbody = b }
 				| Unknownnodebody -> Unknownnode
 			in
 			let nodebits = bitstring_of_node node in
@@ -1094,12 +1203,77 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
       pagecache#release_page nodepage.page true (Some newnodepage);
       pagecache#release_page 0 false None;
 			(* return the new complete node record *)			
-      return (nodepage.page,node)
+      return node
     (** add a new entry to the master index/version (node must be entry node), already 
       added. Blocks until (at least) this addition is in working version. *)
-    method add_entry (node:node) : unit Lwt.t = raise_lwt (Failure "unimplemented")
+    method add_entry (node:entrynode) : unit Lwt.t = 
+			(* just add to pending list *)
+			new_entry_nodes <- node :: new_entry_nodes;
+			return ()
     (** commit/release session *)
-    method commit () : unit Lwt.t = raise_lwt (Failure "unimplemented")
+    method commit () : unit Lwt.t = 
+			(* sort new_entry_nodes by key *)
+			new_entry_nodes <- List.sort compare_entrynode new_entry_nodes;			
+			(* merge into existing btree *)
+			(* we build up a stack of sub-trees, to which we, combining them as they match in level.*)
+			(* we also keep track of where we are in the old btree *)
+      lwt rootpage = pagecache#lock_page 0 in
+			(* not exhaustive but shouldn't fail *)
+      let Some rootnode = rootpage.rootnode in
+			let oldrootref = (rootnode.rbody.rootpage,rootnode.rbody.rootoffset) in
+			let get_node (page,offset) = self#read_node page offset in
+			lwt bti = bti_new get_node oldrootref in
+			(* Level 0 is an entity. *)
+			let btb : btreebuildrec list = [] in
+			(* recursive add: btreeiterator, newnodes, btreebuildrecs *)
+			let rec add_enodes ((btieno,btirecs) as bti) newnodes (btbrecs: btreebuildrec list) : btreebuildrec list Lwt.t =
+				(* actual add *)
+				let add_enode bti btbrecs enode : btreebuildrec list Lwt.t =
+					(* this is the next entrynode to add *)
+					(* add it to the list.. *)
+					let node = Entrynode enode in
+					let keyvalue = get_keyvalue node in
+					let btbr = { btbnode = node; btblevel = 0; btbvalue = keyvalue } in
+					OS.Console.log (sprintf "Index node %d/%d level 0 value %s" enode.enpage enode.enoffset (dump_of_keyvalue keyvalue));
+					let btbrecs = btbr :: btbrecs in
+					(* now merge tail pair(s) at same level *)
+					let rec merge_btbrecs ((btieno,btirecs) as bti) btbrecs : btreebuildrec list Lwt.t = match btbrecs with
+						| { btblevel = n1level } as n1 :: { btblevel = n2level } as n2 :: rest ->
+							if (n1level=n2level) then (
+							) else if (n1level>n2level) then
+								OS.Console.log (sprintf "Bad btbrec list; top level %d > next level %d" n1level n2level);
+								
+						...
+					in lwt btbrecs = merge_btbrecs bti btbrecs in
+					(* TODO... *)
+					return btbrecs
+				in match (btieno,newnodes) with
+				  (* sort out whether next is from old btree index or new entries... *)
+					| (None,[]) -> return btbrecs
+					| (Some en,[]) -> begin
+						  lwt btbrecs = add_enode bti btbrecs en in
+							lwt bti = bti_advance get_node bti in
+							add_enodes bti newnodes btbrecs
+					  end
+					| (None,en::ns) -> begin
+						  lwt btbrecs = add_enode bti btbrecs en in
+							add_enodes bti ns btbrecs
+						end
+					| (Some oen,nen::ns) -> begin
+						  let cmp = compare_entrynode oen nen in
+							if (cmp<0) then begin
+							  lwt btbrecs = add_enode bti btbrecs oen in
+								lwt bti = bti_advance get_node bti in
+								add_enodes bti newnodes btbrecs
+							end else begin
+							  lwt btbrecs = add_enode bti btbrecs nen in
+								add_enodes bti ns btbrecs
+							end					
+						end
+			in lwt btbrecs = add_enodes bti new_entry_nodes [] in
+			(* update root node *)
+			(*...*)
+			return ()
     (** abort *)
     method abort () : unit Lwt.t = raise_lwt (Failure "unimplemented")
 	end 
@@ -1127,74 +1301,35 @@ and sessionmanagerimpl (_blkep : Blkifendpoint.blkendpoint) =
 			sessions <- session :: sessions;
 			return (session :> session)
 	end
-
-let is_null_ref (page,offset) = page=0 && offset=0
-
-type btreeiterrec = { btinode : btreenode; btibody : btreenodebody; btiright : bool }
-
 (** btree iterator *)
-class btreeiter (session:session) (root:noderef) =
+and btreeiter (session:session) (root:noderef) =
 	object (self)
 	  val session = session
 	  val root = root
-	  val mutable stack : btreeiterrec list = []
-		val mutable nextentrynode : entrynode option = None
+	  val mutable t : btreeitert  = (None,[])
 		val mutable is_new = true
-		
+		method peek () : entrynode option Lwt.t =
+			(if (is_new) then 
+				self#init() 
+			else return ())
+			>> return (fst t)
 		method next () : entrynode option Lwt.t =
-      let node = nextentrynode in
-			(if (is_new) then self#init() else self#advance ()) >>
-			return node
+			(if (is_new) then 
+				self#init()
+			else return () 
+			)>> 
+			let node = fst t in
+			(self#advance () >>
+			return node)					
 		method private go_left (page,offset) : unit Lwt.t =
-			let rec go_left (page,offset) : unit Lwt.t =
-        if (is_null_ref (page,offset)) then return () 
-          else begin
-            lwt node = session#read_node page offset in
-            match node with 
-              | Entrynode en -> begin 
-								  nextentrynode <- Some en; 
-									return ()
-								end                           
-              | Btreenode bn -> begin
-                  stack <- { btinode=bn; btibody = bn.bbody; btiright = false} :: stack;
-                  go_left (bn.bbody.lpage,bn.bbody.loffset)
-                end
-              | _ -> begin
-                  OS.Console.log (sprintf "invalid node type found at %d/%d in btree rooted at %d/%d" 
-                    page offset (fst root) (snd root));
-									return ()
-                end
-					end
-      in go_left (page,offset)
+			lwt nt = bti_go_left (fun (page,offset) -> session#read_node page offset) (page,offset) t in
+			t <- nt; return()
 		method private init() : unit Lwt.t =
 			is_new <- false;
 			self#go_left root
 		method private advance () : unit Lwt.t =
-      match nextentrynode with
-				| None -> return () (* noop *)
-				| Some en -> begin
-					  (* pop all trues off the top *)
-            let rec skip_true stack = match stack with
-							| { btiright = true } :: rest -> skip_true rest
-							| _ -> stack
-						in 
-						let s = skip_true stack in
-						stack <- s;
-						(* if there is a false left, swap to true... *)
-						match stack with
-							| [] -> (* done *) begin
-								  nextentrynode <- None;
-									return ()
-							  end
-							| { btiright = false; btibody = bn } as btirec :: ts -> begin
-								  stack <- { btirec with btiright = true } :: ts;
-									(* now traverse to bottom of right branch, keeping left *)
-									(* not exhaustive *)
-									nextentrynode <- None;
-									self#go_left (bn.rpage,bn.roffset)
-								end
-							| _ -> raise (Failure "Weird error: btreeiter stack with true left at top")
-					end
+			lwt nt = bti_advance (fun (page,offset) -> session#read_node page offset) t in
+			t <- nt; return ()
 	end
 
 (** test session *)
@@ -1220,26 +1355,21 @@ let main() =
 	let valuepage = 0 (*TODO*) in
 	let valueoffset = 0 (*TODO*) in
 	let (keyprefix,extrakey) = split_key key in
-	lwt (pagenum,entrynode) = session#add_node entrynodesize entrynodetype extrakey (make_node_body (version.vtimestamp) (version.vsequence)
+	lwt entrynode = session#add_node entrynodesize entrynodetype extrakey (make_node_body (version.vtimestamp) (version.vsequence)
 	  keyprefix extrakey valuepage valueoffset) in
-  OS.Console.log (sprintf "added entry node at %d/%d" pagenum (get_node_offset entrynode));
+  OS.Console.log (sprintf "added entry node at %d/%d" (get_node_page entrynode) (get_node_offset entrynode));
 	(* get root of old btree (if any) *)
 	let oldrootref = (version.vrootpage,version.vrootoffset) in
 	let rec print_entry iter =
 		lwt node = iter#next() in match node with 
 			| None -> return ()
 			| Some { enoffset; ebody = { 
-              ekeyprefix; ekeyoffset; valuepage;
+              ekeyprefix; ekeyoffset; valuepage; ekeyextra;
               valueoffset; timestamp; sequence } } ->
 				begin
-          let keyprefix = string_of_bitstring ekeyprefix in
-          let keyprefix =
-            try
-              let ix = String.index keyprefix (Char.chr 0) in
-              String.sub keyprefix 0 ix
-            with Not_found -> keyprefix in
-          OS.Console.log (sprintf "Entry node at %d with key %s+@%d:%s, value at %d:%d, timestamp %ld, sequence %Ld" 
-              enoffset keyprefix ekeyoffset "?" valuepage valueoffset timestamp sequence );
+          let keydump = dump_of_keyvalue (ekeyprefix,ekeyextra) in
+          OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, timestamp %ld, sequence %Ld" 
+              enoffset keydump ekeyoffset valuepage valueoffset timestamp sequence );
 					print_entry iter
 				end 
 	in
@@ -1247,10 +1377,16 @@ let main() =
   let olditer = new btreeiter session oldrootref in
   OS.Console.log "Old entries...";
   print_entry olditer >>
-	(* now another one to try to make a new btree... *)
-  let olditer = new btreeiter session oldrootref in
-	
+	(* add entry *)
+	(OS.Console.log "Add entrynode";
+	(* partial... *)
+	let Entrynode en = entrynode in 
+	session#add_entry en >>
+	(OS.Console.log "Commit";
+	session#commit () >>
+	(OS.Console.log "Done";
   return ()
+	)))
 	
 (*---------------------------------------------------------------------------*)
 (* test app - dump nodes in the root block *)
@@ -1290,17 +1426,9 @@ let dumproot () =
         | Entrynode { enoffset; ebody = { 
               ekeyprefix; ekeyoffset; ekeyextra; valuepage;
 							valueoffset; timestamp; sequence } } ->
-								let keyprefix = string_of_bitstring ekeyprefix in
-								let keyprefix =
-									try
-										let ix = String.index keyprefix (Char.chr 0) in
-										String.sub keyprefix 0 ix
-									with Not_found -> keyprefix in
-								let extrakey = match ekeyextra with
-									| None -> ""
-									| Some bs -> string_of_bitstring bs in
-                OS.Console.log (sprintf "Entry node at %d with key %s+%s@%d, value at %d:%d, timestamp %ld, sequence %Ld" 
-                enoffset keyprefix extrakey ekeyoffset valuepage valueoffset timestamp sequence )
+								let keydump = dump_of_keyvalue (ekeyprefix, ekeyextra) in 
+                OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, timestamp %ld, sequence %Ld" 
+                enoffset keydump ekeyoffset valuepage valueoffset timestamp sequence )
         | _ -> let noffset = get_node_offset n in
 				  let header = get_node_header n in
 	        OS.Console.log (sprintf "Node %d at %d" header.nodetype noffset) in
