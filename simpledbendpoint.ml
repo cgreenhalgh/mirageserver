@@ -2,8 +2,6 @@
  * anyway... 
  * 
  * Next:
- * 1) create btree index when
- * an entry is added, and update root accordingly.
  * 2) define value nodes and un/marhshalling routines; implement allocation for
  * new and link into entry node; implement bytestreamout on top of this. 
  * Implement bytestreamin on top of read value pages.
