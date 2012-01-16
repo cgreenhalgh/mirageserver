@@ -481,17 +481,20 @@ let parse_node pagedata offset size nodetype pagenum : node =
 		raise (Failure (sprintf "Unknown node type %d" nodetype))	
 				
 (** create a rootnode for given root page & offset *)
-let create_rootnode rootpage rootoffset lastpage lastnodepage = BITSTRING {
+let create_rootnodebody rootpage rootoffset lastpage lastnodepage = {
+		magic; version; rootpage; rootoffset; lastpage; lastnodepage }
+	
+let bitstring_of_rootnodebody n = BITSTRING {
 	  rootnodesize : 16 : unsigned, littleendian;
 		rootnodetype : 16 : unsigned, littleendian;
-		magic : 32 : bigendian; (* magic *)
-		version : 16 : littleendian; (* version *)
-		rootpage : 30 : unsigned, littleendian;
+		n.magic : 32 : bigendian; (* magic *)
+		n.version : 16 : littleendian; (* version *)
+		n.rootpage : 30 : unsigned, littleendian;
     0 : 2; (* pad *)
-		rootoffset : 16 : unsigned, littleendian;
-		lastpage : 30 : unsigned, littleendian; (* last page *)
+		n.rootoffset : 16 : unsigned, littleendian;
+		n.lastpage : 30 : unsigned, littleendian; (* last page *)
     0 : 2 (* pad *);
-    lastnodepage : 30 : unsigned, littleendian; (* last nodepage *)
+    n.lastnodepage : 30 : unsigned, littleendian; (* last nodepage *)
     0 : 2 (* pad *)
 		(* reserved *)
 	}
@@ -529,7 +532,7 @@ let bitstring_of_btreenodebody b =
 let bitstring_of_node node = match node with 
 	| Entrynode { ebody } ->	bitstring_of_entrynodebody ebody
   | Btreenode{ bbody } -> bitstring_of_btreenodebody bbody
-	| Rootnode _ -> raise (Failure "bitstring_of_node does not support Rootnode")
+	| Rootnode {rbody} -> bitstring_of_rootnodebody rbody
   | Unknownnode _ -> raise (Failure "bitstring_of_node does not support Unknownnode")
 
 let sizelog2 size = 
@@ -546,8 +549,9 @@ let sizelog2 size =
 let create_rootpage size sizelog2 = 
 	let rootheader = bitstring_of_pageheader 
   	{ pagetype=rootpagetype; pagesizelog2=sizelog2 } in 
-	let rootnode = create_rootnode 0 0 0 0 in
-	concat [ rootheader; rootnode; zeroes_bitstring (((size-pageheadersize)*8)-bitstring_length rootnode) ]
+	let rootnodebody = create_rootnodebody 0 0 0 0 in
+	let rootnodebits = bitstring_of_rootnodebody rootnodebody in
+	concat [ rootheader; rootnodebits; zeroes_bitstring (((size-pageheadersize)*8)-bitstring_length rootnodebits) ]
 
 (** write page back; blocking *)
 let write_page blkep page =
@@ -1091,7 +1095,8 @@ let bti_advance (getnode:(noderef -> node Lwt.t)) (eno,recs) : btreeitert Lwt.t 
 let bti_new (getnode:(noderef -> node Lwt.t)) rootref : btreeitert Lwt.t = 
 	bti_go_left getnode rootref (None,[])
 
-type btreebuildrec = { btbnode : node; btbvalue : keyvalue; btblevel : int }
+(* a node at the top in a new index; maxvalue is right; btbbtirecs is (optional) old node parents for possible reuse *)
+type btreebuildrec = { btbnode : node; btbmaxvalue : keyvalue; btblevel : int; btbbtirecs : btreeiterrec list }
 
 (** session manager mutable state includes:
     list of current sessions
@@ -1167,6 +1172,9 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 					let newrootnode = { rootnode with rbody = { 
 						rootnode.rbody with lastpage = lastpagenum; lastnodepage = lastnodepagenum } } in
 					let newrootpage = { rootpage with rootnode = Some newrootnode } in
+					let rootnodebits = bitstring_of_rootnodebody newrootnode.rbody in
+					(* nb position in bytes *)
+					bitstring_write rootnodebits rootnode.rnoffset rootpage.data; 
           pagecache#release_page 0 true (Some newrootpage);	
 					OS.Console.log (sprintf "allocate new node page %d" lastnodepagenum);		
 					(* not actually repeating check - if this doesn't work nothing will*)
@@ -1210,8 +1218,16 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 			(* just add to pending list *)
 			new_entry_nodes <- node :: new_entry_nodes;
 			return ()
+	  (** new btree node *)
+		method private new_btree_node level (lpage,loffset) (rpage,roffset) (bkeyprefix,bkeyextra) : node Lwt.t =
+			let make_body bkeyoffset = Btreenodebody { 
+				level; bkeyprefix; bkeyoffset; bkeyextra; lpage; loffset; rpage; roffset; 
+			} in
+			OS.Console.log (sprintf "Creating new btree node l=%d/%d r=%d/%d value=%s" lpage loffset rpage roffset (dump_of_keyvalue (bkeyprefix,bkeyextra)));
+			self#add_node btreenodesize (btreenodetype+level-1) bkeyextra make_body 
     (** commit/release session *)
     method commit () : unit Lwt.t = 
+			if (List.length new_entry_nodes)=0 then return () else begin
 			(* sort new_entry_nodes by key *)
 			new_entry_nodes <- List.sort compare_entrynode new_entry_nodes;			
 			(* merge into existing btree *)
@@ -1228,52 +1244,101 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 			(* recursive add: btreeiterator, newnodes, btreebuildrecs *)
 			let rec add_enodes ((btieno,btirecs) as bti) newnodes (btbrecs: btreebuildrec list) : btreebuildrec list Lwt.t =
 				(* actual add *)
-				let add_enode bti btbrecs enode : btreebuildrec list Lwt.t =
+				let add_enode bti btbrecs enode btirecs : btreebuildrec list Lwt.t =
 					(* this is the next entrynode to add *)
 					(* add it to the list.. *)
 					let node = Entrynode enode in
 					let keyvalue = get_keyvalue node in
-					let btbr = { btbnode = node; btblevel = 0; btbvalue = keyvalue } in
+					let btbr = { btbnode = node; btblevel = 0; btbmaxvalue = keyvalue; btbbtirecs = btirecs } in
 					OS.Console.log (sprintf "Index node %d/%d level 0 value %s" enode.enpage enode.enoffset (dump_of_keyvalue keyvalue));
 					let btbrecs = btbr :: btbrecs in
 					(* now merge tail pair(s) at same level *)
-					let rec merge_btbrecs ((btieno,btirecs) as bti) btbrecs : btreebuildrec list Lwt.t = match btbrecs with
-						| { btblevel = n1level } as n1 :: { btblevel = n2level } as n2 :: rest ->
-							if (n1level=n2level) then (
-							) else if (n1level>n2level) then
-								OS.Console.log (sprintf "Bad btbrec list; top level %d > next level %d" n1level n2level);
-								
-						...
-					in lwt btbrecs = merge_btbrecs bti btbrecs in
-					(* TODO... *)
-					return btbrecs
+					let rec merge_btbrecs btbrecs : btreebuildrec list Lwt.t = match btbrecs with
+						| { btblevel = rlevel } as r :: ( { btblevel = llevel; btbbtirecs = btirecs } as l :: rest ) ->
+							if (llevel=rlevel) then (
+								(* merge... *)
+								let lref = get_node_ref l.btbnode in
+								let rref = get_node_ref r.btbnode in
+								let level = llevel+1 in
+								let value = l.btbmaxvalue in
+								let maxvalue = r.btbmaxvalue in
+								let new_btree_node () = self#new_btree_node level lref rref value in
+								(* do we already have the required node in the bti? *)
+								lwt (btn,btirecs) = match r.btbbtirecs with
+									| { btinode = { 
+												bbody = { lpage; loffset; rpage; roffset; level }
+											} as oldbtn 
+										} :: rest 
+										when lpage = (fst lref) && loffset = (snd lref) &&  
+													rpage = (fst rref) && roffset = (snd rref) && level = level 
+										-> (
+										  OS.Console.log (sprintf "Re-use btreenode %d/%d" oldbtn.bnpage oldbtn.bnoffset);
+										  return (Btreenode oldbtn, rest) 
+										)									
+									| _ -> (* no - make a new one *) 
+									  lwt nbtn = new_btree_node () in
+										return (nbtn, []) 
+								in let newbtn = { btblevel = level; btbnode = btn; btbbtirecs = btirecs; btbmaxvalue = maxvalue } in
+								merge_btbrecs (newbtn :: rest)
+							) else begin
+								if (rlevel>llevel) then
+								  OS.Console.log (sprintf "Bad btbrec list; top level %d > next level %d" rlevel llevel);
+								return btbrecs
+							end
+						| _ -> return btbrecs
+					in merge_btbrecs btbrecs 
 				in match (btieno,newnodes) with
 				  (* sort out whether next is from old btree index or new entries... *)
 					| (None,[]) -> return btbrecs
 					| (Some en,[]) -> begin
-						  lwt btbrecs = add_enode bti btbrecs en in
+						  lwt btbrecs = add_enode bti btbrecs en btirecs in
 							lwt bti = bti_advance get_node bti in
 							add_enodes bti newnodes btbrecs
 					  end
 					| (None,en::ns) -> begin
-						  lwt btbrecs = add_enode bti btbrecs en in
+						  lwt btbrecs = add_enode bti btbrecs en [] in
 							add_enodes bti ns btbrecs
 						end
 					| (Some oen,nen::ns) -> begin
 						  let cmp = compare_entrynode oen nen in
-							if (cmp<0) then begin
-							  lwt btbrecs = add_enode bti btbrecs oen in
+							if (cmp<=0) then begin
+							  lwt btbrecs = add_enode bti btbrecs oen btirecs in
 								lwt bti = bti_advance get_node bti in
 								add_enodes bti newnodes btbrecs
 							end else begin
-							  lwt btbrecs = add_enode bti btbrecs nen in
+							  lwt btbrecs = add_enode bti btbrecs nen [] in
 								add_enodes bti ns btbrecs
 							end					
 						end
 			in lwt btbrecs = add_enodes bti new_entry_nodes [] in
+			(* now add partial btree nodes to collapse to a single entry *)
+			let rec pmerge_btbrecs btbrecs : node option Lwt.t = match btbrecs with
+				| [] -> return None
+				| { btbnode = n } :: [] -> return (Some n)
+				| r :: (l :: rest) -> begin
+						let lref = get_node_ref l.btbnode in
+						let rref = get_node_ref r.btbnode in
+						let level = l.btblevel+1 in
+						let value = l.btbmaxvalue in
+						let maxvalue = r.btbmaxvalue in
+						lwt nbtn = self#new_btree_node level lref rref value in
+					  pmerge_btbrecs ({ btbnode = nbtn; btblevel = level; btbmaxvalue = maxvalue; btbbtirecs = [] }:: rest)
+					end
+			in lwt newroot = pmerge_btbrecs btbrecs in
 			(* update root node *)
-			(*...*)
+			let rootref = match newroot with
+				| Some n -> (get_node_page n, get_node_offset n)
+				| None -> (0,0)
+			in 
+			let newrootnode = { rootnode with rbody = { rootnode.rbody with rootpage = (fst rootref); rootoffset = (snd rootref) } } in
+			let newrootpage = { rootpage with rootnode = Some newrootnode } in
+			let rootnodebits = bitstring_of_rootnodebody newrootnode.rbody in
+			(* nb position in bytes *)
+			bitstring_write rootnodebits rootnode.rnoffset rootpage.data; 
+      pagecache#release_page 0 true (Some newrootpage);	
+			OS.Console.log (sprintf "Updated root to %d/%d" (fst rootref) (snd rootref));		
 			return ()
+			end
     (** abort *)
     method abort () : unit Lwt.t = raise_lwt (Failure "unimplemented")
 	end 
@@ -1429,11 +1494,38 @@ let dumproot () =
 								let keydump = dump_of_keyvalue (ekeyprefix, ekeyextra) in 
                 OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, timestamp %ld, sequence %Ld" 
                 enoffset keydump ekeyoffset valuepage valueoffset timestamp sequence )
+				| Btreenode { bnoffset; bbody = { bkeyprefix; bkeyoffset; bkeyextra; lpage; loffset; rpage; roffset } } ->
+					let keydump = dump_of_keyvalue (bkeyprefix,bkeyextra) in
+          OS.Console.log (sprintf "Bree node at %d with key %s@%d, left %d:%d, right %d:%d" 
+            bnoffset keydump bkeyoffset lpage loffset rpage roffset )
+					
         | _ -> let noffset = get_node_offset n in
 				  let header = get_node_header n in
 	        OS.Console.log (sprintf "Node %d at %d" header.nodetype noffset) in
 	List.iter (print_node rootpage) rootpage.nodes ;
-	return ()
+	let rec print_entry iter =
+		lwt node = iter#next() in match node with 
+			| None -> return ()
+			| Some { enoffset; ebody = { 
+              ekeyprefix; ekeyoffset; valuepage; ekeyextra;
+              valueoffset; timestamp; sequence } } ->
+				begin
+          let keydump = dump_of_keyvalue (ekeyprefix,ekeyextra) in
+          OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, timestamp %ld, sequence %Ld" 
+              enoffset keydump ekeyoffset valuepage valueoffset timestamp sequence );
+					print_entry iter
+				end 
+	in
+  (* iterator for old btree *)
+  let sessionmanager = new sessionmanagerimpl blkep in
+	(* make a session and check the version *)
+	lwt session = sessionmanager#get_session() in
+	let version = session#get_version () in
+	let oldrootref = (version.vrootpage,version.vrootoffset) in
+  let olditer = new btreeiter session oldrootref in
+  OS.Console.log "Iterate entries...";
+  print_entry olditer >>
+  return ()
 
 (*---------------------------------------------------------------------------*)
 (* EOF *)
