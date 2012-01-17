@@ -42,35 +42,30 @@
  * Each node starts with a 2-byte ID:
  *  0 = end-node
  *  1 = root-node
- *  256 = value-leaf-node
- *  257- = value-nodes of varying levels
+ *  256- = value-nodes of varying levels (level 256 refers to value whole-pages (offset 0))
  *  2 = entry node
  *  512- = b-tree-nodes of varying levels
  * 
  * Page ID:
  *  1 = structured page, v.1
  * 
- * value-leaf-node = BITSTRING {
- *   size [20] : 16 : unsigned;
- *   nodetype [1] : 16 : unsigned; 
- *   page0pad [0] : 2;
- *   page0 : 30 : unsigned;
- *   page1pad : 2
- *   page1 : 30 : unsigned;
- * }
- * Total = 20 bytes.
- *
  * value-node = BITSTRING {
  *   size [16] : 16 : unsigned;
- *   nodetype [2-32] : 16 : unsigned; 
- *   vnode0pad : 2;
- *   vnode0page : 30 : unsigned;
- *   vnode0offset : 16;
- *   vnode1pad : 2;
- *   vnode1page : 30 : unsigned;
- *   vnode1offset : 16: unsigned;
+ *   nodetype [256-511] : 16 : unsigned; 
+ *   v0pad : 2;
+ *   v0page : 30 : unsigned;
+ *   v0offset : 16;
+ *   v1pad : 2;
+ *   v1page : 30 : unsigned;
+ *   v1offset : 16;
+ *   v2pad : 2;
+ *   v2page : 30 : unsigned;
+ *   v2offset : 16;
+ *   v3pad : 2;
+ *   v3page : 30 : unsigned;
+ *   v3offset : 16;
  * }
- * Total = 16
+ * Total = 28
  * 
  * entry-node = BITSTRING {
  *   size [32] : 16 : unsigned;
@@ -80,10 +75,11 @@
  *   0 : 2;
  *   valuepage : 30 : unsigned;
  *   valueoffset : 16 : unsigned;
+ *   valuelength : 64; 
  *   timestamp : 32;
  *   sequence : 64;
  * }
- * Total = 32
+ * Total = 40
  * 
  * btree-node = BITSTRING {
  *   size [26] : 16 : unsigned;
@@ -140,50 +136,18 @@ type simpledb = <
 >
 
 (*---------------------------------------------------------------------------*)
-(* implementation of abstract simpleDB interface - skeleton *)
-
-(** internal state *)
-type t = {
-    id : string;
-    blkep : Blkifendpoint.blkendpoint;
-    (* ... ? *) 
-}
-
-(** recv implementation *)
-let _recv t (key:string) : bytestreamin inresult Lwt.t =
-	(* no *) 
-	return Complete
-	
-(** getbuf implementation *)
-let _getbuf t (key:string) : bytestreamout Lwt.t =
-	(* bytestreamout *)	
-	return (object
-	  method getbuf size : (Bitstring.t * unit * bytestreamoutbuf) Lwt.t =
-			raise_lwt (Failure "unimplemented");
-    method discardout () = ()
-	end)
-	
-(** get simpledb over specified blkif *)
-let get name : simpledb Lwt.t =
-  lwt blkep = (Blkifendpoint.get "test") in 
-  OS.Console.log (sprintf "Got simpledb blkif name %s, sector size %d" blkep#id blkep#block_size);
-	let t = { id = blkep#id; blkep = blkep } in
-  return (object
-	  method id = blkep#id;
-		method recv key : bytestreamin inresult Lwt.t = _recv t key ;
-		method getbuf key : bytestreamout Lwt.t = _getbuf t key;
-	end)
-	
-(*---------------------------------------------------------------------------*)
 (* constants and sizes for on-disk storage *)
 
 (** page header size, bytes *)
 let pageheadersize = 4
 (** root page type *)
+let freepagetype = 0
 let rootpagetype = 1
 let nodepagetype = 2
 let valuepagetype = 3
     
+type pagetype = Rootpagetype | Nodepagetype | Valuepagetype | Freepagetype
+		
 (** root node size *)
 let rootnodesize = 32
 (** root node type *)
@@ -199,7 +163,7 @@ let entrynodetype = 2
 (** bits of key in prefix (bytes) *)
 let keyprefixlength = 8
 (** length of entrynode record *)
-let entrynodesize = 32
+let entrynodesize = 40
 
 (** btree node type *)
 let btreenodetype = 512
@@ -209,6 +173,12 @@ let btreenodelevelmask = 0x00ff
 
 (** btree node size *)
 let btreenodesize = 26
+
+(** value node size *)
+let valuenodesize = 28
+let valuenodetype = 256
+let valuenodetypemask = 0xff00
+let valuenodelevelmask = 0x00ff
 
 (*---------------------------------------------------------------------------*)
 (* in-memory structures for underlying data storage *)
@@ -251,6 +221,7 @@ type entrynodebody = {
 	ekeyextra : bitstring option;
   valuepage : int;
   valueoffset : int;
+	valuelength : int64;
   timestamp : int32;
   sequence : int64;
 }
@@ -283,14 +254,36 @@ type btreenode = {
 	bbody : btreenodebody
 }
 
+(** value node record *)
+type valuenodebody = {
+	vlevel : int;
+  v0page : int;
+ 	v0offset : int;
+  v1page : int;
+  v1offset : int;
+  v2page : int;
+  v2offset : int;
+  v3page : int;
+  v3offset : int;
+}
+
+type valuenode = {
+	vnpage : int;
+	vnoffset : int;
+	vheader : nodeheader;
+	vbody : valuenodebody
+}
+
 type nodebody = Rootnodebody of rootnodebody
  | Entrynodebody of entrynodebody
  | Btreenodebody of btreenodebody
+ | Valuenodebody of valuenodebody
  | Unknownnodebody
 
 type node = Rootnode of rootnode
  | Entrynode of entrynode
  | Btreenode of btreenode
+ | Valuenode of valuenode
  | Unknownnode
 
 (** get offset *)
@@ -298,6 +291,7 @@ let get_node_offset node : int = match node with
 	| Entrynode { enoffset } -> enoffset
 	| Rootnode { rnoffset } -> rnoffset
 	| Btreenode { bnoffset } -> bnoffset
+	| Valuenode { vnoffset } -> vnoffset
 	| Unknownnode -> raise (Failure "get_node_offset for Unknownnode")
 
 (** get page *)
@@ -305,6 +299,7 @@ let get_node_page node : int = match node with
 	| Entrynode { enpage } -> enpage
 	| Rootnode { rnpage } -> rnpage
 	| Btreenode { bnpage } -> bnpage
+	| Valuenode { vnpage } -> vnpage
 	| Unknownnode -> raise (Failure "get_node_page for Unknownnode")
 
 (** get page/offset *)
@@ -312,6 +307,7 @@ let get_node_ref node : (int*int)= match node with
 	| Entrynode { enpage; enoffset } -> (enpage,enoffset)
 	| Rootnode { rnpage; rnoffset } -> (rnpage,rnoffset)
 	| Btreenode { bnpage; bnoffset  } -> (bnpage,bnoffset)
+	| Valuenode { vnpage; vnoffset  } -> (vnpage,vnoffset)
 	| Unknownnode -> raise (Failure "get_node_ref for Unknownnode")
 
 (** get nodeheader *)
@@ -319,11 +315,13 @@ let get_node_header node : nodeheader = match node with
 	| Entrynode { eheader } -> eheader
 	| Rootnode { rheader } -> rheader
 	| Btreenode { bheader } -> bheader
+	| Valuenode { vheader } -> vheader
 	| Unknownnode -> raise (Failure "get_node_header for Unknownnode")
  
 let get_node_level node : int = match node with
 	| Entrynode _ -> 0
 	| Btreenode { bbody = { level } } -> level
+	| Valuenode { vbody = { vlevel } } -> vlevel
 	(* incomplete *)
 
 type keyvalue = bitstring * (bitstring option)
@@ -343,6 +341,25 @@ type extrakey = {
 	ksize : int;
 	extra : bitstring
 }
+
+let int_of_pagetype pagetype = match pagetype with
+	| Rootpagetype -> rootpagetype
+	| Nodepagetype -> nodepagetype
+	| Valuepagetype -> valuepagetype
+  | Freepagetype -> freepagetype
+	
+let string_of_pagetype pagetype = match pagetype with
+	| Rootpagetype -> "Rootpagetype"
+	| Nodepagetype -> "Nodepagetype"
+	| Valuepagetype -> "Valuepagetype"
+  | Freepagetype -> "Freepagetype"
+	
+let pagetype_of_int pti = 
+	if (pti=rootpagetype) then Rootpagetype
+	else if (pti=nodepagetype) then Nodepagetype
+	else if (pti=valuepagetype) then Valuepagetype
+	else if (pti=freepagetype) then Freepagetype
+	else raise (Failure (sprintf "Unknown page type %d" pti))
 
 (** page cache entry *)
 type page = {
@@ -440,6 +457,7 @@ let parse_node pagedata offset size nodetype pagenum : node =
       0 : 2;
       valuepage : 30 : unsigned, littleendian;
       valueoffset : 16 : unsigned, littleendian;
+			valuelength : 64 : littleendian;
       timestamp : 32 : littleendian;
       sequence : 64 : littleendian
     } -> Entrynode { enpage = pagenum; enoffset = offset; eheader = header;
@@ -449,6 +467,7 @@ let parse_node pagedata offset size nodetype pagenum : node =
 					 ekeyextra = parse_extrakey pagedata ekeyoffset;
 				   valuepage = valuepage;
 					 valueoffset = valueoffset;
+					 valuelength;
 					 timestamp = timestamp;
 					 sequence = sequence
          } }
@@ -475,6 +494,25 @@ let parse_node pagedata offset size nodetype pagenum : node =
 			  rpage = rpage;
 			  roffset = roffset;
 		} }
+  end else if ((nodetype land valuenodetypemask) = valuenodetype) then begin
+		let vlevel = nodetype land valuenodelevelmask in
+		bitmatch data with {
+	    0 : 2;
+  	  v0page : 30 : unsigned, littleendian;
+    	v0offset : 16 : unsigned, littleendian;
+    	0 : 2;
+    	v1page : 30 : unsigned, littleendian;
+    	v1offset : 16 : unsigned, littleendian;
+    	0 : 2;
+    	v2page : 30 : unsigned, littleendian;
+    	v2offset : 16 : unsigned, littleendian;
+    	0 : 2;
+    	v3page : 30 : unsigned, littleendian;
+    	v3offset : 16 : unsigned, littleendian
+    } -> Valuenode { 
+			vnpage = pagenum; vnoffset = offset; vheader = header;
+      vbody = { vlevel; v0page; v0offset; v1page; v1offset; v2page; v2offset; v3page; v3offset }
+		} 
 	end else
 		raise (Failure (sprintf "Unknown node type %d" nodetype))	
 				
@@ -509,6 +547,7 @@ let bitstring_of_entrynodebody n =
     0 : 2;
     n.valuepage : 30 : unsigned, littleendian;
     n.valueoffset : 16 : unsigned, littleendian;
+		n.valuelength : 64 : littleendian;
     n.timestamp : 32 : littleendian;
     n.sequence : 64 : littleendian
 	}
@@ -516,7 +555,7 @@ let bitstring_of_entrynodebody n =
 let bitstring_of_btreenodebody b =
 	BITSTRING {
 		btreenodesize : 16 : unsigned, littleendian;
-		(btreenodetype+(b.level-1)) : 16 : unsigned, littleendian;
+		(btreenodetype+b.level) : 16 : unsigned, littleendian;
     b.bkeyprefix : keyprefixlength*8 : bitstring;
     b.bkeyoffset : 16 : unsigned, littleendian;
     0 : 2;
@@ -527,10 +566,29 @@ let bitstring_of_btreenodebody b =
     b.roffset : 16: unsigned, littleendian
 	}
 
+let bitstring_of_valuenodebody b =
+	BITSTRING {
+    valuenodesize : 16 : unsigned, littleendian;
+    (valuenodetype+b.vlevel) : 16 : unsigned, littleendian; 
+    0 : 2;
+    b.v0page : 30 : unsigned, littleendian;
+    b.v0offset : 16 : unsigned, littleendian;
+    0 : 2;
+    b.v1page : 30 : unsigned, littleendian;
+    b.v1offset : 16 : unsigned, littleendian;
+    0 : 2;
+    b.v2page : 30 : unsigned, littleendian;
+    b.v2offset : 16 : unsigned, littleendian;
+    0 : 2;
+    b.v3page : 30 : unsigned, littleendian;
+    b.v3offset : 16 : unsigned, littleendian
+  }
+
 let bitstring_of_node node = match node with 
 	| Entrynode { ebody } ->	bitstring_of_entrynodebody ebody
   | Btreenode{ bbody } -> bitstring_of_btreenodebody bbody
 	| Rootnode {rbody} -> bitstring_of_rootnodebody rbody
+	| Valuenode { vbody } -> bitstring_of_valuenodebody vbody
   | Unknownnode _ -> raise (Failure "bitstring_of_node does not support Unknownnode")
 
 let sizelog2 size = 
@@ -610,6 +668,12 @@ let rec omit_root_node nodes =
 (** try to parse a structured page *)
 let parse_page pagenum data : page =
     let pageheader = parse_pageheader data in
+		let hasnodes = pageheader.pagetype=rootpagetype || pageheader.pagetype=nodepagetype in
+		if (not hasnodes) then
+	    { page = pagenum; pageheader = pageheader;
+	      data = data; rootnode = None; nodes = []; pnodeoffset = 0;
+      	extrakeys = []; pextrakeyoffset = 0 }
+		else (
     (* data starts at current page *)
     let rec read_nodes pagedata offset nodes = bitmatch (dropbits (offset*8) pagedata) with
         { size : 16 : unsigned, littleendian;
@@ -647,7 +711,7 @@ let parse_page pagenum data : page =
     { page = pagenum; pageheader = pageheader;
       data = data; rootnode = rootnode; nodes = nodes; pnodeoffset = pnodeoffset;
       extrakeys = extrakeys; pextrakeyoffset = pextrakeyoffset }
-        
+    )    
 (** split key into fixed length prefix and option of variable length remainder *)
 let split_key key =
 	if (bitstring_length key > keyprefixlength*8) then
@@ -773,6 +837,8 @@ type pageinfo = {
 
 
 type pagecache = <
+  (** page size *)
+  page_size : int;
   (** lock page for read or write *)
   lock_page : int -> page Lwt.t;
 	(** release lock on page (pagenum,dirty,new page option) *)
@@ -810,6 +876,7 @@ class jobqueue =
 class pagecacheimpl (blkep : Blkifendpoint.blkendpoint) =
 	object (self)
 	  val blkep = blkep
+		method page_size = blkep#block_size
 		(** hashtable of pages in cache *)
     val cachepages : (int, pageinfo) Hashtbl.t = Hashtbl.create cachesize
 		(** jobqueue to coordinate with worker thread(s) *)
@@ -1023,7 +1090,7 @@ type session = <
 
 type sessionmanager = <
   (** get a session within which to interact with the database - read and/or add *)
-  get_session : unit -> session
+  get_session : unit -> session Lwt.t
 >
 
 (*---------------------------------------------------------------------------*)
@@ -1108,8 +1175,12 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 		val version = version;
 		(** nodes read or written *)
     val mutable noderefs = NoderefSet.empty 
-    (** value pages read and not released or new/written *)
-    val mutable value_pages = IntSet.empty
+    (** value pages read and not released *)
+    val mutable read_value_pages = IntSet.empty
+    (** new value pages not released written *)
+    val mutable new_value_pages = IntSet.empty
+    (** new value pages written not committed *)
+    val mutable written_value_pages = IntSet.empty
 		(** entrynodes to be added to index in next commit *)
 		val mutable new_entry_nodes : entrynode list = []
     method get_version () = version
@@ -1132,13 +1203,62 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 					  raise_lwt (Failure "not found")
 					end
     (** read a value page [release??] *)
-    method read_value_page (pagenum:int) : page Lwt.t = raise_lwt (Failure "unimplemented")
+    method read_value_page (pagenum:int) : page Lwt.t = 
+			lwt valuepage = pagecache#lock_page pagenum in
+			read_value_pages <- IntSet.add pagenum read_value_pages;
+			return valuepage
     (** release a value page from read_value_page *)
-    method release_value_page (page:page) : unit = () (*noop*)
+    method release_value_page (page:page) : unit = 
+			if (IntSet.mem page.page read_value_pages) then begin
+				pagecache#release_page page.page false None;
+				read_value_pages <- IntSet.remove page.page read_value_pages
+			end else 
+				OS.Console.log (sprintf "release_value_page for unread page %d" page.page)
+		(** allocate a new page, update rootnode, update lastnodepagenum if nodepage -> page is locked *)
+		method private lock_new_page pagetype : page Lwt.t =
+      lwt rootpage = pagecache#lock_page 0 in
+      let Some rootnode = rootpage.rootnode in
+			let lastpagenum = rootnode.rbody.lastpage+1 in
+	    let newpagenum = lastpagenum in
+      let lastnodepagenum = 
+				if (pagetype=Nodepagetype) then newpagenum 
+				else rootnode.rbody.lastnodepage in
+			(* TODO: create without read... *)
+			lwt newpage = pagecache#lock_page newpagenum in
+			(* initialise as new page *)
+			let pageheader = { pagetype = (int_of_pagetype pagetype); 
+				pagesizelog2 = (sizelog2 pagecache#page_size) } in
+			let pageheaderbits = bitstring_of_pageheader pageheader in
+			bitstring_write pageheaderbits 0 newpage.data;
+			(* leave locked *)
+			(* update root node on root page *)
+      lwt rootpage = pagecache#lock_page 0 in
+			let newrootnode = { rootnode with rbody = { 
+					rootnode.rbody with lastpage = lastpagenum; lastnodepage = lastnodepagenum } } in
+			let newrootpage = { rootpage with rootnode = Some newrootnode } in
+			let rootnodebits = bitstring_of_rootnodebody newrootnode.rbody in
+			(* nb position in bytes *)
+			bitstring_write rootnodebits rootnode.rnoffset rootpage.data; 
+      pagecache#release_page 0 true (Some newrootpage);	
+			OS.Console.log (sprintf "allocated new %s page %d" (string_of_pagetype pagetype) newpagenum);		
+			return newpage
     (** get a value output page *)
-    method new_value_page () : page Lwt.t = raise_lwt (Failure "unimplemented")
-    (** write a value output page *)
-    method write_value_page (page:page) : unit Lwt.t = raise (Failure "unimplemented")
+    method new_value_page () : page Lwt.t = 
+			lwt newpage = self#lock_new_page Valuepagetype in
+			new_value_pages <- IntSet.add newpage.page new_value_pages;
+			return newpage
+    (** write a value output page (actually non-blocking at present) *)
+    method write_value_page (page:page) : unit Lwt.t = 
+			if (IntSet.mem page.page new_value_pages) then begin
+				(* doesn't update parsed record - should only have written bytes into data after page header *)
+				pagecache#release_page page.page true None;
+				written_value_pages <- IntSet.add page.page written_value_pages;
+				new_value_pages <- IntSet.remove page.page new_value_pages;
+				return ()
+			end else begin
+				OS.Console.log (sprintf "release_value_page for unread page %d" page.page);
+				return ()
+			end
     (** write a node (nodesize,extrakey option,fn extrakeyoffset->node body) -> node *)
     method add_node (nodesize:int) (nodetype:int) (extrakey:bitstring option) (makenodebody:(int -> nodebody)) : node Lwt.t =
       (* which page can this be allocated in? *)
@@ -1150,37 +1270,17 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
       let lastpagenum = rootnode.rbody.lastpage in
       let lastnodepagenum = rootnode.rbody.lastnodepage in
 			(* TODO: check key is small enough for this DB blocksize *)
-			(* may need to repeat... [TODO: actually we don't] *)
-			let rec find_page lastnodepagenum : page Lwt.t =
-				(* try last page *)
-   			lwt lastnodepage = pagecache#lock_page lastnodepagenum in
+			(* try last page *)
+			lwt nodepage = 
+	 			lwt lastnodepage = pagecache#lock_page lastnodepagenum in
 				if (is_room_for_node lastnodepage nodesize extrakeylen) then 
 					return lastnodepage
 			  else begin
 					pagecache#release_page lastnodepagenum false None;
 					(* last node page is no good; start a new page *)
-					let lastnodepagenum = lastpagenum+1 in
-					let lastpagenum = lastpagenum+1 in
-					(* TODO: create without read... *)
-					lwt lastnodepage = pagecache#lock_page lastnodepagenum in
-					(* initialise as new node page *)
-					(* TODO *)
-					(* update root node on root page *)
-          lwt rootpage = pagecache#lock_page 0 in
-					let newrootnode = { rootnode with rbody = { 
-						rootnode.rbody with lastpage = lastpagenum; lastnodepage = lastnodepagenum } } in
-					let newrootpage = { rootpage with rootnode = Some newrootnode } in
-					let rootnodebits = bitstring_of_rootnodebody newrootnode.rbody in
-					(* nb position in bytes *)
-					bitstring_write rootnodebits rootnode.rnoffset rootpage.data; 
-          pagecache#release_page 0 true (Some newrootpage);	
-					OS.Console.log (sprintf "allocate new node page %d" lastnodepagenum);		
-					(* not actually repeating check - if this doesn't work nothing will*)
-					(* and we should check that, but separately *)
-					return lastnodepage
+					self#lock_new_page Nodepagetype
 				end
 			in
-			lwt nodepage = find_page lastnodepagenum in
       (* write the extrakey *)
 			let (keyoffset,extrakey) = match extrakey with 
 				| Some extrakeybits -> begin
@@ -1197,6 +1297,7 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 				| Rootnodebody b -> Rootnode { rnpage = nodepage.page; rnoffset = nodepage.pnodeoffset; rheader = header; rbody = b }
 				| Entrynodebody b -> Entrynode { enpage = nodepage.page; enoffset = nodepage.pnodeoffset; eheader = header; ebody = b }
 				| Btreenodebody b -> Btreenode { bnpage = nodepage.page; bnoffset = nodepage.pnodeoffset; bheader = header; bbody = b }
+				| Valuenodebody b -> Valuenode { vnpage = nodepage.page; vnoffset = nodepage.pnodeoffset; vheader = header; vbody = b }
 				| Unknownnodebody -> Unknownnode
 			in
 			let nodebits = bitstring_of_node node in
@@ -1231,10 +1332,13 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 			(* merge into existing btree *)
 			(* we build up a stack of sub-trees, to which we, combining them as they match in level.*)
 			(* we also keep track of where we are in the old btree *)
+			(*let oldrootref = (version.vrootpage,version.vrootoffset) in*)
+			(* TODO: concurrent updates? *)
       lwt rootpage = pagecache#lock_page 0 in
 			(* not exhaustive but shouldn't fail *)
       let Some rootnode = rootpage.rootnode in
 			let oldrootref = (rootnode.rbody.rootpage,rootnode.rbody.rootoffset) in
+      pagecache#release_page 0 false None;	
 			let get_node (page,offset) = self#read_node page offset in
 			lwt bti = bti_new get_node oldrootref in
 			(* Level 0 is an entity. *)
@@ -1328,6 +1432,10 @@ class sessionimpl (mgr : sessionmanagerimpl) (pagecache : pagecache) (version : 
 				| Some n -> (get_node_page n, get_node_offset n)
 				| None -> (0,0)
 			in 
+			(* re-read/lock after all nodes added because that may change rootnode! *)
+      lwt rootpage = pagecache#lock_page 0 in
+			(* not exhaustive but shouldn't fail *)
+      let Some rootnode = rootpage.rootnode in
 			let newrootnode = { rootnode with rbody = { rootnode.rbody with rootpage = (fst rootref); rootoffset = (snd rootref) } } in
 			let newrootpage = { rootpage with rootnode = Some newrootnode } in
 			let rootnodebits = bitstring_of_rootnodebody newrootnode.rbody in
@@ -1404,22 +1512,24 @@ let main() =
 	let version = session#get_version () in
 	OS.Console.log (sprintf "version root=%d/%d timestamp=%ld sequence=%Ld" version.vrootpage version.vrootoffset version.vtimestamp version.vsequence);
 	(* add an entry node *)
-	let make_node_body timestamp sequence ekeyprefix ekeyextra valuepage valueoffset extrakeyoffset : nodebody =
+	let make_node_body timestamp sequence ekeyprefix ekeyextra valuepage valueoffset valuelength extrakeyoffset : nodebody =
 		Entrynodebody { 
 			ekeyprefix = ekeyprefix;
 			ekeyoffset = extrakeyoffset;
 			ekeyextra = ekeyextra;
 			valuepage = valuepage;
 			valueoffset = valueoffset;
+			valuelength;
 			timestamp = timestamp;
 			sequence = sequence;
 		} in
 	let key = bitstring_of_string "abcdefghijkl" in
 	let valuepage = 0 (*TODO*) in
 	let valueoffset = 0 (*TODO*) in
+	let valuelength = 0L (*TODO*) in
 	let (keyprefix,extrakey) = split_key key in
 	lwt entrynode = session#add_node entrynodesize entrynodetype extrakey (make_node_body (version.vtimestamp) (version.vsequence)
-	  keyprefix extrakey valuepage valueoffset) in
+	  keyprefix extrakey valuepage valueoffset valuelength) in
   OS.Console.log (sprintf "added entry node at %d/%d" (get_node_page entrynode) (get_node_offset entrynode));
 	(* get root of old btree (if any) *)
 	let oldrootref = (version.vrootpage,version.vrootoffset) in
@@ -1428,11 +1538,11 @@ let main() =
 			| None -> return ()
 			| Some { enoffset; ebody = { 
               ekeyprefix; ekeyoffset; valuepage; ekeyextra;
-              valueoffset; timestamp; sequence } } ->
+              valueoffset; valuelength; timestamp; sequence } } ->
 				begin
           let keydump = dump_of_keyvalue (ekeyprefix,ekeyextra) in
-          OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, timestamp %ld, sequence %Ld" 
-              enoffset keydump ekeyoffset valuepage valueoffset timestamp sequence );
+          OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, %Ld bytes, timestamp %ld, sequence %Ld" 
+              enoffset keydump ekeyoffset valuepage valueoffset valuelength timestamp sequence );
 					print_entry iter
 				end 
 	in
@@ -1488,15 +1598,17 @@ let dumproot () =
           rnoffset rootpage rootoffset lastpage)
         | Entrynode { enoffset; ebody = { 
               ekeyprefix; ekeyoffset; ekeyextra; valuepage;
-							valueoffset; timestamp; sequence } } ->
+							valueoffset; valuelength; timestamp; sequence } } ->
 								let keydump = dump_of_keyvalue (ekeyprefix, ekeyextra) in 
-                OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, timestamp %ld, sequence %Ld" 
-                enoffset keydump ekeyoffset valuepage valueoffset timestamp sequence )
+                OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, %Ld bytes, timestamp %ld, sequence %Ld" 
+                enoffset keydump ekeyoffset valuepage valueoffset valuelength timestamp sequence )
 				| Btreenode { bnoffset; bbody = { bkeyprefix; bkeyoffset; bkeyextra; lpage; loffset; rpage; roffset } } ->
 					let keydump = dump_of_keyvalue (bkeyprefix,bkeyextra) in
           OS.Console.log (sprintf "Bree node at %d with key %s@%d, left %d:%d, right %d:%d" 
             bnoffset keydump bkeyoffset lpage loffset rpage roffset )
-					
+				| Valuenode { vnoffset; vbody = { v0page; v0offset; v1page; v1offset; v2page; v2offset; v3page; v3offset } } ->
+          OS.Console.log (sprintf "Value node at %d with children %d:%d, %d:%d, %d:%d, %d:%d" 
+            vnoffset v0page v0offset v1page v1offset v2page v2offset v3page v3offset )
         | _ -> let noffset = get_node_offset n in
 				  let header = get_node_header n in
 	        OS.Console.log (sprintf "Node %d at %d" header.nodetype noffset) in
@@ -1506,11 +1618,11 @@ let dumproot () =
 			| None -> return ()
 			| Some { enoffset; ebody = { 
               ekeyprefix; ekeyoffset; valuepage; ekeyextra;
-              valueoffset; timestamp; sequence } } ->
+              valueoffset; valuelength; timestamp; sequence } } ->
 				begin
           let keydump = dump_of_keyvalue (ekeyprefix,ekeyextra) in
-          OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, timestamp %ld, sequence %Ld" 
-              enoffset keydump ekeyoffset valuepage valueoffset timestamp sequence );
+          OS.Console.log (sprintf "Entry node at %d with key %s@%d, value at %d:%d, %Ld bytes, timestamp %ld, sequence %Ld" 
+              enoffset keydump ekeyoffset valuepage valueoffset valuelength timestamp sequence );
 					print_entry iter
 				end 
 	in
@@ -1525,5 +1637,42 @@ let dumproot () =
   print_entry olditer >>
   return ()
 
+(*---------------------------------------------------------------------------*)
+(* implementation of abstract simpleDB interface - skeleton *)
+
+(** internal state *)
+type t = {
+    id : string;
+    blkep : Blkifendpoint.blkendpoint;
+		sessionmanager : sessionmanager
+    (* ... ? *) 
+}
+
+(** recv implementation *)
+let _recv t (key:string) : bytestreamin inresult Lwt.t =
+	(* no *) 
+	return Complete
+	
+(** getbuf implementation *)
+let _getbuf t (key:string) : bytestreamout Lwt.t =
+	(* bytestreamout *)	
+	return (object
+	  method getbuf size : (Bitstring.t * unit * bytestreamoutbuf) Lwt.t =
+			raise_lwt (Failure "unimplemented");
+    method discardout () = ()
+	end)
+	
+(** get simpledb over specified blkif *)
+let get name : simpledb Lwt.t =
+  lwt blkep = (Blkifendpoint.get "test") in 
+  OS.Console.log (sprintf "Got simpledb blkif name %s, sector size %d" blkep#id blkep#block_size);
+	let sessionmanager = ((new sessionmanagerimpl blkep) :> sessionmanager) in
+	let t = { id = blkep#id; blkep = blkep; sessionmanager } in
+  return (object
+	  method id = blkep#id;
+		method recv key : bytestreamin inresult Lwt.t = _recv t key ;
+		method getbuf key : bytestreamout Lwt.t = _getbuf t key;
+	end)
+	
 (*---------------------------------------------------------------------------*)
 (* EOF *)
